@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torchvine"
+version = "0.1.0"
+description = "Pure-PyTorch vine copula modelling — GPU-ready, differentiable, and API-compatible with pyvinecopulib"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+keywords = ["copula", "vine-copula", "pytorch", "gpu", "statistics", "dependence-modeling"]
+authors = [
+  { name = "Bluerrror" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "torch>=2.0",
+  "matplotlib>=3.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pyvinecopulib>=0.6",
+  "scipy>=1.10",
+  "numpy>=1.24",
+  "nbformat>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/bluerror2710/torchvine"
+Repository = "https://github.com/bluerror2710/torchvine"
+Issues = "https://github.com/bluerror2710/torchvine/issues"
+
+[tool.setuptools]
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["torchvine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
