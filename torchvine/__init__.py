@@ -15,6 +15,27 @@ from .tll_fit import to_pseudo_obs
 import torch
 
 
+def get_device(verbose: bool = False) -> torch.device:
+    """Return the best available device (CUDA if available, else CPU).
+
+    Parameters
+    ----------
+    verbose : bool, optional
+        If ``True``, print which device was selected.
+
+    Returns
+    -------
+    torch.device
+    """
+    if torch.cuda.is_available():
+        dev = torch.device("cuda")
+    else:
+        dev = torch.device("cpu")
+    if verbose:
+        print(f"torchvine: using device '{dev}'")
+    return dev
+
+
 def simulate_uniform(
     n: int,
     d: int,
@@ -119,6 +140,7 @@ __all__ = [
     "CVineStructure",
     "Vinecop",
     "to_pseudo_obs",
+    "get_device",
     "simulate_uniform",
     "sobol",
     "ghalton",
