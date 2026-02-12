@@ -371,64 +371,54 @@ class Vinecop:
         # Reorder evaluation points to natural order (vectorized).
         order = self.structure.order
         order_idx = torch.tensor([o - 1 for o in order], dtype=torch.long, device=device)
-        hfunc1 = torch.zeros((n, d), device=device, dtype=dtype)
-        hfunc2 = u_main[:, order_idx]
-        hfunc1_sub = torch.zeros((n, d), device=device, dtype=dtype)
-        hfunc2_sub = u_sub[:, order_idx]
-        hfunc1[:] = hfunc2
-        hfunc1_sub[:] = hfunc2_sub
+        _hfunc2_init = u_main[:, order_idx]
+        _hfunc2_sub_init = u_sub[:, order_idx]
+
+        # Use lists of 1-D tensors (one per column) to avoid in-place
+        # slice assignments that break autograd.
+        hfunc2 = [_hfunc2_init[:, i] for i in range(d)]
+        hfunc1 = [h.clone() for h in hfunc2]
+        hfunc2_sub = [_hfunc2_sub_init[:, i] for i in range(d)]
+        hfunc1_sub = [h.clone() for h in hfunc2_sub]
 
         pdf = torch.ones((n,), device=device, dtype=dtype)
         tiny = torch.finfo(dtype).tiny
-
-        # Reuse per-edge buffers to avoid repeated allocations.
-        uu2 = torch.empty((n, 2), device=device, dtype=dtype)
-        uu4 = torch.empty((n, 4), device=device, dtype=dtype)
-        uu4_sub = torch.empty((n, 4), device=device, dtype=dtype)
 
         for tree in range(trunc_lvl):
             for edge in range(d - tree - 1):
                 cop = self.pair_copulas[tree][edge]
                 m = self.structure.min_at(tree, edge)
-                u1 = hfunc2[:, edge]
+                u1 = hfunc2[edge]
                 if m == self.structure.struct_at(tree, edge):
-                    u2 = hfunc2[:, m - 1]
-                    u2_sub = hfunc2_sub[:, m - 1]
+                    u2 = hfunc2[m - 1]
+                    u2_sub = hfunc2_sub[m - 1]
                 else:
-                    u2 = hfunc1[:, m - 1]
-                    u2_sub = hfunc1_sub[:, m - 1]
+                    u2 = hfunc1[m - 1]
+                    u2_sub = hfunc1_sub[m - 1]
 
                 if "d" in cop.var_types:
-                    u1_sub = hfunc2_sub[:, edge]
-                    uu4[:, 0] = u1
-                    uu4[:, 1] = u2
-                    uu4[:, 2] = u1_sub
-                    uu4[:, 3] = u2_sub
-                    uu = uu4
+                    u1_sub = hfunc2_sub[edge]
+                    uu = torch.stack([u1, u2, u1_sub, u2_sub], dim=1)
                 else:
-                    uu2[:, 0] = u1
-                    uu2[:, 1] = u2
-                    uu = uu2
+                    uu = torch.stack([u1, u2], dim=1)
                 dens = cop.pdf(uu)
                 pdf = pdf * dens
 
                 # Compute h-functions only if needed (mirrors vinecopulib).
                 if self.structure.needed_hfunc1_at(tree, edge):
-                    hfunc1[:, edge] = cop.hfunc1(uu)
+                    hfunc1[edge] = cop.hfunc1(uu)
                     if cop.var_types[1] == "d" and uu.shape[1] == 4:
-                        uu4_sub[:] = uu  # type: ignore[assignment]
-                        uu4_sub[:, 1] = uu4_sub[:, 3]
-                        hfunc1_sub[:, edge] = cop.hfunc1(uu4_sub)
+                        uu_sub = torch.stack([uu[:, 0], uu[:, 3], uu[:, 2], uu[:, 3]], dim=1)
+                        hfunc1_sub[edge] = cop.hfunc1(uu_sub)
                     else:
-                        hfunc1_sub[:, edge] = hfunc1[:, edge]
+                        hfunc1_sub[edge] = hfunc1[edge]
                 if self.structure.needed_hfunc2_at(tree, edge):
-                    hfunc2[:, edge] = cop.hfunc2(uu)
+                    hfunc2[edge] = cop.hfunc2(uu)
                     if cop.var_types[0] == "d" and uu.shape[1] == 4:
-                        uu4_sub[:] = uu  # type: ignore[assignment]
-                        uu4_sub[:, 0] = uu4_sub[:, 2]
-                        hfunc2_sub[:, edge] = cop.hfunc2(uu4_sub)
+                        uu_sub = torch.stack([uu[:, 2], uu[:, 1], uu[:, 2], uu[:, 3]], dim=1)
+                        hfunc2_sub[edge] = cop.hfunc2(uu_sub)
                     else:
-                        hfunc2_sub[:, edge] = hfunc2[:, edge]
+                        hfunc2_sub[edge] = hfunc2[edge]
 
         # Prevent negative zeros from numerical noise (and avoid underflow to 0 from product)
         return pdf.clamp_min(tiny)

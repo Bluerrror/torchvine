@@ -614,7 +614,8 @@ class Bicop:
 
     def _pdf0(self, u_rot: torch.Tensor) -> torch.Tensor:
         if self.family == BicopFamily.indep:
-            return torch.ones((u_rot.shape[0],), device=u_rot.device, dtype=u_rot.dtype)
+            # Use (u*0 + 1) instead of torch.ones to preserve autograd graph.
+            return u_rot[:, 0] * 0.0 + 1.0
 
         if self.family == BicopFamily.tll:
             g = self._get_interp_grid(device=u_rot.device, dtype=u_rot.dtype)
