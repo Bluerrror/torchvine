@@ -263,7 +263,7 @@ class Kde1d:
         """Evaluate the quantile function at probability *p*."""
         self._check_fitted()
         pt = torch.as_tensor(p, dtype=torch.float64).reshape(-1).clamp(0.0, 1.0)
-        idx = torch.searchsorted(self._cdf_t, pt).clamp(1, self._grid_t.numel() - 1)
+        idx = torch.searchsorted(self._cdf_t.contiguous(), pt.contiguous()).clamp(1, self._grid_t.numel() - 1)
         c0 = self._cdf_t[idx - 1]
         c1 = self._cdf_t[idx]
         dc = (c1 - c0).clamp(min=1e-300)

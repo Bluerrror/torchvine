@@ -96,10 +96,10 @@ class InterpolationGrid:
             self.values = self.values / col_integrals[None, :]
 
     def _indices(self, x0: torch.Tensor, x1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        grid = self.grid_points
+        grid = self.grid_points.contiguous()
         m = grid.numel()
-        i = torch.searchsorted(grid, x0, right=True) - 1
-        j = torch.searchsorted(grid, x1, right=True) - 1
+        i = torch.searchsorted(grid, x0.contiguous(), right=True) - 1
+        j = torch.searchsorted(grid, x1.contiguous(), right=True) - 1
         i = i.clamp(0, m - 2)
         j = j.clamp(0, m - 2)
         return i, j
