@@ -705,9 +705,12 @@ class VinecopSelectorTorch:
                         cop.select(pc, bc)
 
             e.pair_copula = cop
-            # store loglik/npars for mbicv computations
+            # store loglik/npars for mbicv computations — use cached loglik from select/fit if available
             try:
-                e.loglik = float(cop.loglik(pc, weights=(wts[mask] if wts is not None and wts.numel() > 0 else None)))
+                if hasattr(cop, '_fit_loglik') and cop._fit_loglik is not None:
+                    e.loglik = float(cop._fit_loglik)
+                else:
+                    e.loglik = float(cop.loglik(pc, weights=(wts[mask] if wts is not None and wts.numel() > 0 else None)))
             except Exception:
                 e.loglik = 0.0
             e.npars = float(cop.get_npars())

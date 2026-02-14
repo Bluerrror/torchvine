@@ -28,7 +28,7 @@ def golden_section_maximize(
     a: float,
     b: float,
     x0: float | None = None,
-    max_iter: int = 60,
+    max_iter: int = 30,
     tol: float = 1e-10,
 ) -> OptimizeResult:
     """Bounded 1D maximization using golden section search.
@@ -113,12 +113,13 @@ def coordinate_descent_maximize(
             if not (a < b):
                 continue
 
-            def fk(v: float) -> float:
-                xx = x.clone()
-                xx[k] = float(v)
-                return float(f(xx))
+            saved_val = float(x[k].item())
 
-            res = golden_section_maximize(fk, a=a, b=b, x0=float(x[k].item()), max_iter=max_inner, tol=tol)
+            def fk(v: float, _k=k) -> float:
+                x[_k] = float(v)
+                return float(f(x))
+
+            res = golden_section_maximize(fk, a=a, b=b, x0=saved_val, max_iter=max_inner, tol=tol)
             n_eval += res.n_eval
             x[k] = float(res.x.item())
             if res.fun > best + 1e-12:

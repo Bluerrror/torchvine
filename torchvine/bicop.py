@@ -21,6 +21,7 @@ _ROTATIONS = (0, 90, 180, 270)
 _ITAU_FAMILIES = (
     BicopFamily.indep,
     BicopFamily.gaussian,
+    BicopFamily.student,
     BicopFamily.clayton,
     BicopFamily.gumbel,
     BicopFamily.frank,
@@ -58,7 +59,7 @@ def _bisect_in_01_for_target_phi_prime(
     phi_prime_fn: Callable[[torch.Tensor], torch.Tensor],
     target: torch.Tensor,
     *,
-    max_iter: int = 90,
+    max_iter: int = 50,
     eps: float = 1e-10,
 ) -> torch.Tensor:
     # Solve phi'(x) = target for x in (0,1) by bisection.
@@ -73,12 +74,54 @@ def _bisect_in_01_for_target_phi_prime(
     return (lo + hi) * 0.5
 
 
+def _bisect_in_01_for_target_phi_prime_gumbel(
+    theta: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    max_iter: int = 40,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    """Specialized bisection for gumbel phi'(x) = target, inlined formula."""
+    lo = torch.full_like(target, eps)
+    hi = torch.full_like(target, 1.0 - eps)
+    tiny = torch.finfo(target.dtype).tiny
+    for _ in range(max_iter):
+        mid = (lo + hi) * 0.5
+        neg_log_mid = (-torch.log(mid)).clamp_min(tiny)
+        val = -theta * torch.pow(neg_log_mid, theta - 1.0) / mid
+        lo = torch.where(val < target, mid, lo)
+        hi = torch.where(val >= target, mid, hi)
+    return (lo + hi) * 0.5
+
+
+def _bisect_in_01_for_target_phi_prime_joe(
+    theta: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    max_iter: int = 40,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    """Specialized bisection for joe phi'(x) = target, inlined formula."""
+    lo = torch.full_like(target, eps)
+    hi = torch.full_like(target, 1.0 - eps)
+    tiny = torch.finfo(target.dtype).tiny
+    for _ in range(max_iter):
+        mid = (lo + hi) * 0.5
+        b = (1.0 - mid).clamp_min(tiny)
+        bt = torch.pow(b, theta)
+        D = (1.0 - bt).clamp_min(tiny)
+        val = -theta * torch.pow(b, theta - 1.0) / D
+        lo = torch.where(val < target, mid, lo)
+        hi = torch.where(val >= target, mid, hi)
+    return (lo + hi) * 0.5
+
+
 def _bisect_u2_for_hfunc1(
     u1: torch.Tensor,
     w: torch.Tensor,
     *,
     hfunc1_fn: Callable[[torch.Tensor], torch.Tensor],
-    max_iter: int = 90,
+    max_iter: int = 50,
     eps: float = 1e-10,
 ) -> torch.Tensor:
     # Solve hfunc1([u1,u2]) = w for u2 in (0,1).
@@ -98,7 +141,7 @@ def _bisect_u1_for_hfunc2(
     w: torch.Tensor,
     *,
     hfunc2_fn: Callable[[torch.Tensor], torch.Tensor],
-    max_iter: int = 90,
+    max_iter: int = 50,
     eps: float = 1e-10,
 ) -> torch.Tensor:
     # Solve hfunc2([u1,u2]) = w for u1 in (0,1).
@@ -239,7 +282,7 @@ def _debye1(x: float) -> float:
     return x * (s + 1.0 - x / 4.0)
 
 
-def _invert_monotone_1d(target: float, f: Callable[[float], float], *, lo: float, hi: float, max_iter: int = 100) -> float:
+def _invert_monotone_1d(target: float, f: Callable[[float], float], *, lo: float, hi: float, max_iter: int = 50) -> float:
     # Bisection inversion for monotone increasing f on [lo,hi].
     a = float(lo)
     b = float(hi)
@@ -303,6 +346,7 @@ class Bicop:
     var_types: tuple[str, str] = ("c", "c")
     nobs: int = 0
     _interp_grid: InterpolationGrid | None = field(default=None, init=False, repr=False)
+    _fit_loglik: float | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         self.family = normalize_family(self.family)
@@ -631,6 +675,23 @@ class Bicop:
             expo = expo + 0.5 * (x1 * x1 + x2 * x2)
             return torch.exp(expo) / den
 
+        if self.family == BicopFamily.student:
+            rho = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype).clamp(-0.999999, 0.999999)
+            nu = torch.as_tensor(self.parameters[..., 1], device=u_rot.device, dtype=u_rot.dtype).clamp(2.01, 100.0)
+            # Batch both qt calls for efficiency (reduces Python loop overhead)
+            u_cat = torch.cat([u_rot[:, 0], u_rot[:, 1]])
+            x_cat = stats.qt(u_cat, nu)
+            n = u_rot.shape[0]
+            x1, x2 = x_cat[:n], x_cat[n:]
+            # c(u1,u2) = f2(x1,x2;rho,nu) / (f_nu(x1)*f_nu(x2))
+            log_c = (torch.lgamma((nu + 2.0) * 0.5) + torch.lgamma(nu * 0.5)
+                     - 2.0 * torch.lgamma((nu + 1.0) * 0.5)
+                     - 0.5 * torch.log((1.0 - rho * rho).clamp_min(1e-20)))
+            log_c = log_c + (nu + 1.0) * 0.5 * (torch.log1p(x1 * x1 / nu) + torch.log1p(x2 * x2 / nu))
+            Q = (x1 * x1 - 2.0 * rho * x1 * x2 + x2 * x2) / (nu * (1.0 - rho * rho).clamp_min(1e-20))
+            log_c = log_c - (nu + 2.0) * 0.5 * torch.log1p(Q)
+            return torch.exp(log_c)
+
         if self.family == BicopFamily.frank:
             theta = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype)
             if torch.any(theta == 0):
@@ -685,14 +746,56 @@ class Bicop:
             expo = (torch.log(u1.clamp_min(tiny)) + torch.log(u2.clamp_min(tiny))) * A
             return torch.exp(expo) * t3 / (u1 * u2).clamp_min(tiny)
 
+        if self.family == BicopFamily.gumbel:
+            theta = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype)
+            tiny = torch.finfo(u_rot.dtype).tiny
+            u1, u2 = u_rot[:, 0], u_rot[:, 1]
+            neg_log_u1 = (-torch.log(u1)).clamp_min(tiny)
+            neg_log_u2 = (-torch.log(u2)).clamp_min(tiny)
+            t1 = torch.pow(neg_log_u1, theta)
+            t2 = torch.pow(neg_log_u2, theta)
+            s = t1 + t2
+            C = torch.exp(-torch.pow(s.clamp_min(tiny), 1.0 / theta))
+            neg_log_C = (-torch.log(C)).clamp_min(tiny)
+            phi_p_u1 = -theta * torch.pow(neg_log_u1, theta - 1.0) / u1
+            phi_p_u2 = -theta * torch.pow(neg_log_u2, theta - 1.0) / u2
+            phi_p_C = -theta * torch.pow(neg_log_C, theta - 1.0) / C
+            phi_pp_C = theta * torch.pow(neg_log_C, theta - 2.0) * (neg_log_C + theta - 1.0) / (C * C)
+            num = torch.abs(phi_pp_C) * torch.abs(phi_p_u1) * torch.abs(phi_p_u2)
+            den = torch.pow(torch.abs(phi_p_C).clamp_min(tiny), 3.0)
+            return num / den
+
+        if self.family == BicopFamily.joe:
+            theta = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype)
+            tiny = torch.finfo(u_rot.dtype).tiny
+            u1, u2 = u_rot[:, 0], u_rot[:, 1]
+            b1 = (1.0 - u1).clamp_min(tiny)
+            b2 = (1.0 - u2).clamp_min(tiny)
+            b1t = torch.pow(b1, theta)
+            b2t = torch.pow(b2, theta)
+            D1 = (1.0 - b1t).clamp_min(tiny)
+            D2 = (1.0 - b2t).clamp_min(tiny)
+            phi_u1 = -torch.log(D1.clamp_min(tiny))
+            phi_u2 = -torch.log(D2.clamp_min(tiny))
+            s = phi_u1 + phi_u2
+            et = torch.exp(-s)
+            C = (1.0 - torch.pow((1.0 - et).clamp_min(tiny), 1.0 / theta))
+            bC = (1.0 - C).clamp_min(tiny)
+            bCt = torch.pow(bC, theta)
+            DC = (1.0 - bCt).clamp_min(tiny)
+            phi_p_u1 = -theta * torch.pow(b1, theta - 1.0) / D1
+            phi_p_u2 = -theta * torch.pow(b2, theta - 1.0) / D2
+            phi_p_C = -theta * torch.pow(bC, theta - 1.0) / DC
+            phi_pp_C_term1 = theta * (theta - 1.0) * torch.pow(bC, theta - 2.0) / DC
+            phi_pp_C_term2 = (theta * theta) * torch.pow(bC, 2.0 * theta - 2.0) / (DC * DC)
+            phi_pp_C = phi_pp_C_term1 + phi_pp_C_term2
+            num = torch.abs(phi_pp_C) * torch.abs(phi_p_u1) * torch.abs(phi_p_u2)
+            den = torch.pow(torch.abs(phi_p_C).clamp_min(tiny), 3.0)
+            return num / den
+
         parts = self._arch_parts()
         if parts is not None:
             phi, psi, phi_p, phi_pp = parts
-            # Move scalar params to the correct device/dtype via closure capture.
-            phi = lambda x, _phi=phi: _phi(x.to(device=u_rot.device, dtype=u_rot.dtype))
-            psi = lambda t, _psi=psi: _psi(t.to(device=u_rot.device, dtype=u_rot.dtype))
-            phi_p = lambda x, _phi_p=phi_p: _phi_p(x.to(device=u_rot.device, dtype=u_rot.dtype))
-            phi_pp = lambda x, _phi_pp=phi_pp: _phi_pp(x.to(device=u_rot.device, dtype=u_rot.dtype))
             return _arch_pdf(u_rot, phi=phi, psi=psi, phi_p=phi_p, phi_pp=phi_pp)
 
         raise NotImplementedError(f"pdf not implemented for family={self.family}")
@@ -709,6 +812,15 @@ class Bicop:
             rho = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype).clamp(-0.999999, 0.999999)
             z = stats.qnorm(u_rot)
             return stats.pbvnorm_drezner(z[:, 0], z[:, 1], rho)
+
+        if self.family == BicopFamily.student:
+            rho = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype).clamp(-0.999999, 0.999999)
+            nu = torch.as_tensor(self.parameters[..., 1], device=u_rot.device, dtype=u_rot.dtype).clamp(2.01, 100.0)
+            u_cat = torch.cat([u_rot[:, 0], u_rot[:, 1]])
+            x_cat = stats.qt(u_cat, nu)
+            n = u_rot.shape[0]
+            x1, x2 = x_cat[:n], x_cat[n:]
+            return stats.pbvt(x1, x2, rho, nu)
 
         if self.family == BicopFamily.frank:
             theta = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype)
@@ -749,8 +861,6 @@ class Bicop:
         parts = self._arch_parts()
         if parts is not None:
             phi, psi, _, _ = parts
-            phi = lambda x, _phi=phi: _phi(x.to(device=u_rot.device, dtype=u_rot.dtype))
-            psi = lambda t, _psi=psi: _psi(t.to(device=u_rot.device, dtype=u_rot.dtype))
             return _arch_cdf(u_rot, phi=phi, psi=psi)
 
         raise NotImplementedError(f"cdf not implemented for family={self.family}")
@@ -769,6 +879,16 @@ class Bicop:
             x = stats.qnorm(u_rot)
             h = (x[:, 1] - rho * x[:, 0]) / torch.sqrt(1.0 - rho * rho)
             return stats.pnorm(h)
+
+        if self.family == BicopFamily.student:
+            rho = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype).clamp(-0.999999, 0.999999)
+            nu = torch.as_tensor(self.parameters[..., 1], device=u_rot.device, dtype=u_rot.dtype).clamp(2.01, 100.0)
+            u_cat = torch.cat([u_rot[:, 0], u_rot[:, 1]])
+            x_cat = stats.qt(u_cat, nu)
+            n = u_rot.shape[0]
+            x1, x2 = x_cat[:n], x_cat[n:]
+            arg = (x2 - rho * x1) / torch.sqrt((nu + x1 * x1) * (1.0 - rho * rho) / (nu + 1.0))
+            return stats.pt(arg, nu + 1.0)
 
         if self.family == BicopFamily.frank:
             theta = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype)
@@ -812,12 +932,48 @@ class Bicop:
             expo = (torch.log(u1.clamp_min(tiny)) + torch.log(u2.clamp_min(tiny))) * A
             return torch.exp(expo) * t3 / u1.clamp_min(tiny)
 
+        if self.family == BicopFamily.gumbel:
+            theta = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype)
+            tiny = torch.finfo(u_rot.dtype).tiny
+            u1, u2 = u_rot[:, 0], u_rot[:, 1]
+            neg_log_u1 = (-torch.log(u1)).clamp_min(tiny)
+            neg_log_u2 = (-torch.log(u2)).clamp_min(tiny)
+            t1 = torch.pow(neg_log_u1, theta)
+            t2 = torch.pow(neg_log_u2, theta)
+            s = t1 + t2
+            C = stats.clamp_unit(torch.exp(-torch.pow(s.clamp_min(tiny), 1.0 / theta)))
+            phi_p_u1 = -theta * torch.pow(neg_log_u1, theta - 1.0) / u1
+            neg_log_C = (-torch.log(C)).clamp_min(tiny)
+            phi_p_C = -theta * torch.pow(neg_log_C, theta - 1.0) / C
+            out = phi_p_u1 / phi_p_C
+            return torch.where(torch.isnan(out), u2, out)
+
+        if self.family == BicopFamily.joe:
+            theta = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype)
+            tiny = torch.finfo(u_rot.dtype).tiny
+            u1, u2 = u_rot[:, 0], u_rot[:, 1]
+            b1 = (1.0 - u1).clamp_min(tiny)
+            b2 = (1.0 - u2).clamp_min(tiny)
+            b1t = torch.pow(b1, theta)
+            b2t = torch.pow(b2, theta)
+            D1 = (1.0 - b1t).clamp_min(tiny)
+            D2 = (1.0 - b2t).clamp_min(tiny)
+            phi_u1 = -torch.log(D1.clamp_min(tiny))
+            phi_u2 = -torch.log(D2.clamp_min(tiny))
+            s = phi_u1 + phi_u2
+            et = torch.exp(-s)
+            C = stats.clamp_unit(1.0 - torch.pow((1.0 - et).clamp_min(tiny), 1.0 / theta))
+            bC = (1.0 - C).clamp_min(tiny)
+            bCt = torch.pow(bC, theta)
+            DC = (1.0 - bCt).clamp_min(tiny)
+            phi_p_u1 = -theta * torch.pow(b1, theta - 1.0) / D1
+            phi_p_C = -theta * torch.pow(bC, theta - 1.0) / DC
+            out = phi_p_u1 / phi_p_C
+            return torch.where(torch.isnan(out), u2, out)
+
         parts = self._arch_parts()
         if parts is not None:
             phi, psi, phi_p, _ = parts
-            phi = lambda x, _phi=phi: _phi(x.to(device=u_rot.device, dtype=u_rot.dtype))
-            psi = lambda t, _psi=psi: _psi(t.to(device=u_rot.device, dtype=u_rot.dtype))
-            phi_p = lambda x, _phi_p=phi_p: _phi_p(x.to(device=u_rot.device, dtype=u_rot.dtype))
             return _arch_hfunc1(u_rot, phi=phi, psi=psi, phi_p=phi_p)
 
         raise NotImplementedError(f"hfunc1 not implemented for family={self.family}")
@@ -867,6 +1023,18 @@ class Bicop:
             hinv = x[:, 1] * torch.sqrt(1.0 - rho * rho) + rho * x[:, 0]
             return stats.pnorm(hinv)
 
+        if self.family == BicopFamily.student:
+            rho = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype).clamp(-0.999999, 0.999999)
+            nu = torch.as_tensor(self.parameters[..., 1], device=u_rot.device, dtype=u_rot.dtype).clamp(2.01, 100.0)
+            # Batch qt calls: qt(u1, nu) and qt(w, nu+1)
+            u_cat = torch.cat([u_rot[:, 0], u_rot[:, 1]])
+            nu_cat = torch.cat([nu.expand(u_rot.shape[0]), (nu + 1.0).expand(u_rot.shape[0])])
+            x_cat = stats.qt(u_cat, nu_cat)
+            n = u_rot.shape[0]
+            x1, q = x_cat[:n], x_cat[n:]
+            x2 = rho * x1 + q * torch.sqrt((nu + x1 * x1) * (1.0 - rho * rho) / (nu + 1.0))
+            return stats.pt(x2, nu)
+
         if self.family == BicopFamily.frank:
             theta = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype)
             if torch.any(theta == 0):
@@ -896,12 +1064,47 @@ class Bicop:
             w = u_rot[:, 1]
             return _bisect_u2_for_hfunc1(u1, w, hfunc1_fn=self._hfunc1_0)
 
+        if self.family == BicopFamily.gumbel:
+            # Newton's method on the Archimedean hinv1 equation: find C s.t. phi'(u1)/phi'(C) = w
+            theta = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype)
+            tiny = torch.finfo(u_rot.dtype).tiny
+            u1 = u_rot[:, 0]
+            w = u_rot[:, 1].clamp(1e-10, 1.0 - 1e-10)
+            # target = phi'(u1) / w
+            neg_log_u1 = (-torch.log(u1)).clamp_min(tiny)
+            phi_p_u1 = -theta * torch.pow(neg_log_u1, theta - 1.0) / u1
+            target = phi_p_u1 / w
+            # Bisect to find C s.t. phi'(C) = target (phi' is monotonically decreasing toward -inf)
+            C = _bisect_in_01_for_target_phi_prime_gumbel(theta, target)
+            phi_C = torch.pow((-torch.log(C)).clamp_min(tiny), theta)
+            phi_u1 = torch.pow(neg_log_u1, theta)
+            phi_u2 = (phi_C - phi_u1).clamp_min(tiny)
+            return stats.clamp_unit(torch.exp(-torch.pow(phi_u2, 1.0 / theta)))
+
+        if self.family == BicopFamily.joe:
+            # Newton's method for joe hinv1
+            theta = torch.as_tensor(self.parameters[..., 0], device=u_rot.device, dtype=u_rot.dtype)
+            tiny = torch.finfo(u_rot.dtype).tiny
+            u1 = u_rot[:, 0]
+            w = u_rot[:, 1].clamp(1e-10, 1.0 - 1e-10)
+            b1 = (1.0 - u1).clamp_min(tiny)
+            b1t = torch.pow(b1, theta)
+            D1 = (1.0 - b1t).clamp_min(tiny)
+            phi_p_u1 = -theta * torch.pow(b1, theta - 1.0) / D1
+            target = phi_p_u1 / w
+            C = _bisect_in_01_for_target_phi_prime_joe(theta, target)
+            bC = (1.0 - C).clamp_min(tiny)
+            bCt = torch.pow(bC, theta)
+            DC = (1.0 - bCt).clamp_min(tiny)
+            phi_C = -torch.log(DC.clamp_min(tiny))
+            phi_u1 = -torch.log(D1.clamp_min(tiny))
+            phi_u2 = (phi_C - phi_u1).clamp_min(tiny)
+            et = torch.exp(-phi_u2)
+            return stats.clamp_unit(1.0 - torch.pow((1.0 - et).clamp_min(tiny), 1.0 / theta))
+
         parts = self._arch_parts()
         if parts is not None:
             phi, psi, phi_p, _ = parts
-            phi = lambda x, _phi=phi: _phi(x.to(device=u_rot.device, dtype=u_rot.dtype))
-            psi = lambda t, _psi=psi: _psi(t.to(device=u_rot.device, dtype=u_rot.dtype))
-            phi_p = lambda x, _phi_p=phi_p: _phi_p(x.to(device=u_rot.device, dtype=u_rot.dtype))
             return _arch_hinv1(u_rot, phi=phi, psi=psi, phi_p=phi_p)
 
         raise NotImplementedError(f"hinv1 not implemented for family={self.family}")
@@ -1216,6 +1419,9 @@ class Bicop:
         elif fam == BicopFamily.gaussian:
             rho = float(p[0])
             tau = (2.0 / math.pi) * math.asin(max(-1.0, min(1.0, rho)))
+        elif fam == BicopFamily.student:
+            rho = float(p[0])
+            tau = (2.0 / math.pi) * math.asin(max(-1.0, min(1.0, rho)))
         elif fam == BicopFamily.clayton:
             th = abs(float(p[0]))
             tau = th / (2.0 + th)
@@ -1232,9 +1438,8 @@ class Bicop:
                 tau = t if th >= 0.0 else -t
         elif fam == BicopFamily.joe:
             th = float(p[0])
-            # tau = 1 + 2*(digamma(2)-digamma(1+2/theta)) / (2-theta)
             tmp = 2.0 / th + 1.0
-            dig = float(torch.digamma(torch.tensor(2.0)).item() - torch.digamma(torch.tensor(tmp)).item())
+            dig = float(torch.digamma(torch.tensor(2.0)).item()) - float(torch.digamma(torch.tensor(tmp)).item())
             tau = 1.0 + 2.0 * dig / (2.0 - th)
         elif fam == BicopFamily.bb1:
             theta, delta = float(p[0]), float(p[1])
@@ -1253,6 +1458,9 @@ class Bicop:
         t = float(tau)
         if fam == BicopFamily.gaussian:
             return torch.tensor([math.sin(t * math.pi / 2.0)], dtype=torch.float64)
+        if fam == BicopFamily.student:
+            rho = math.sin(t * math.pi / 2.0)
+            return torch.tensor([rho, 4.0], dtype=torch.float64)
         if fam == BicopFamily.clayton:
             at = abs(t)
             th = 2.0 * at / max(1e-12, 1.0 - at)
@@ -1275,19 +1483,21 @@ class Bicop:
             lo = -35.0 + 1e-6
             hi = 35.0 - 1e-5
             # tau_of is monotone in theta; invert.
-            th = _invert_monotone_1d(t, tau_of, lo=lo, hi=hi, max_iter=120)
+            th = _invert_monotone_1d(t, tau_of, lo=lo, hi=hi)
             return torch.tensor([th], dtype=torch.float64)
         if fam == BicopFamily.joe:
             at = abs(t)
+            # Cache digamma(2) as a constant
+            _DG2 = float(torch.digamma(torch.tensor(2.0)).item())
 
             def tau_of(theta: float) -> float:
                 tmp = 2.0 / theta + 1.0
-                dig = float(torch.digamma(torch.tensor(2.0)).item() - torch.digamma(torch.tensor(tmp)).item())
+                dig = _DG2 - float(torch.digamma(torch.tensor(tmp)).item())
                 return 1.0 + 2.0 * dig / (2.0 - theta)
 
             lo = 1.0 + 1e-6
             hi = 30.0 - 1e-6
-            th = _invert_monotone_1d(at, tau_of, lo=lo, hi=hi, max_iter=120)
+            th = _invert_monotone_1d(at, tau_of, lo=lo, hi=hi)
             return torch.tensor([th], dtype=torch.float64)
         if fam == BicopFamily.indep:
             return torch.empty((0,), dtype=torch.float64)
@@ -1299,6 +1509,8 @@ class Bicop:
             return torch.empty((0,), dtype=torch.float64), torch.empty((0,), dtype=torch.float64)
         if fam == BicopFamily.gaussian:
             return torch.tensor([-1.0], dtype=torch.float64), torch.tensor([1.0], dtype=torch.float64)
+        if fam == BicopFamily.student:
+            return torch.tensor([-1.0, 2.0], dtype=torch.float64), torch.tensor([1.0, 30.0], dtype=torch.float64)
         if fam == BicopFamily.clayton:
             return torch.tensor([1e-10], dtype=torch.float64), torch.tensor([28.0], dtype=torch.float64)
         if fam == BicopFamily.gumbel:
@@ -1323,6 +1535,8 @@ class Bicop:
         fam = self.family
         if fam == BicopFamily.gaussian:
             return torch.tensor([math.sin(tau * math.pi / 2.0)], dtype=torch.float64)
+        if fam == BicopFamily.student:
+            return torch.tensor([math.sin(tau * math.pi / 2.0), 4.0], dtype=torch.float64)
         if fam in (BicopFamily.clayton, BicopFamily.gumbel, BicopFamily.frank, BicopFamily.joe):
             return self.tau_to_parameters(tau)
         if fam in (BicopFamily.bb1, BicopFamily.bb6, BicopFamily.bb7, BicopFamily.bb8):
@@ -1359,6 +1573,15 @@ class Bicop:
             lb = torch.max(lb2, lb)
             ub = torch.min(ub2, ub)
 
+        if fam == BicopFamily.student:
+            # Refine rho bounds from tau, keep nu bounds
+            lo_tau = max(tau - 0.1, -0.99)
+            hi_tau = min(tau + 0.1, 0.99)
+            rho_lo = math.sin(lo_tau * math.pi / 2.0)
+            rho_hi = math.sin(hi_tau * math.pi / 2.0)
+            lb = torch.tensor([max(rho_lo, -0.999), 2.01], dtype=torch.float64)
+            ub = torch.tensor([min(rho_hi, 0.999), 30.0], dtype=torch.float64)
+
         if fam == BicopFamily.tawn:
             lb = torch.tensor([0.3, 0.3, 1.5], dtype=torch.float64)
             ub = torch.tensor([1.0, 1.0, 7.0], dtype=torch.float64)
@@ -1372,11 +1595,13 @@ class Bicop:
 
         data = torch.as_tensor(data, dtype=torch.float64)
         self.nobs = int(data.shape[0])
+        self._fit_loglik = None  # cached loglik from fitting
         if data.ndim != 2 or data.shape[1] < 2:
             raise ValueError("data must have shape (n, >=2)")
 
         if self.family == BicopFamily.indep:
             self.parameters = torch.empty((0,), dtype=torch.float64)
+            self._fit_loglik = 0.0
             return self
 
         if self.family == BicopFamily.tll:
@@ -1391,6 +1616,7 @@ class Bicop:
             )
             self.parameters = vals.detach()
             self._interp_grid = interp
+            self._fit_loglik = float(_ll)
             return self
 
         # ---- Parametric fitting (port of ParBicop::fit) ----
@@ -1404,10 +1630,42 @@ class Bicop:
         method = controls.parametric_method
         if self.family == BicopFamily.indep:
             self.parameters = torch.empty((0,), dtype=torch.float64)
+            self._fit_loglik = 0.0
             return self
 
         # Method itau: if one-parameter family, no optimization required.
         if method == "itau":
+            if self.family == BicopFamily.student:
+                # Student-t itau: rho from tau, profile-optimize nu using fast Hill qt
+                rho = math.sin(tau * math.pi / 2.0)
+                rho_f = float(rho)
+                rr = 1.0 - rho_f * rho_f
+                log_rr = -0.5 * math.log(max(rr, 1e-20))
+                rr_safe = max(rr, 1e-20)
+                u1 = u_prepped[:, 0]
+                u2 = u_prepped[:, 1]
+                w_data = controls.weights
+
+                def obj_nu(nu_val: float) -> float:
+                    nu = torch.tensor(nu_val, dtype=torch.float64)
+                    # Fast qt via Hill approximation (no Newton/betainc_reg)
+                    x1 = stats._qt_hill(u1, nu)
+                    x2 = stats._qt_hill(u2, nu)
+                    # Inline copula log-density
+                    log_c = (torch.lgamma((nu + 2.0) * 0.5) + torch.lgamma(nu * 0.5)
+                             - 2.0 * torch.lgamma((nu + 1.0) * 0.5) + log_rr)
+                    log_c = log_c + (nu + 1.0) * 0.5 * (torch.log1p(x1 * x1 / nu) + torch.log1p(x2 * x2 / nu))
+                    Q = (x1 * x1 - 2.0 * rho_f * x1 * x2 + x2 * x2) / (nu * rr_safe)
+                    log_c = log_c - (nu + 2.0) * 0.5 * torch.log1p(Q)
+                    if w_data is not None and w_data.numel() > 0:
+                        log_c = log_c * w_data.to(log_c.device, log_c.dtype)
+                    lp = log_c[torch.isfinite(log_c)]
+                    return float(lp.sum().item())
+
+                res = golden_section_maximize(obj_nu, a=2.01, b=30.0, x0=4.0)
+                self.parameters = torch.tensor([rho, float(res.x)], dtype=torch.float64)
+                self._fit_loglik = res.fun
+                return self
             if self.family in (BicopFamily.gaussian, BicopFamily.clayton, BicopFamily.gumbel, BicopFamily.frank, BicopFamily.joe):
                 self.parameters = self.tau_to_parameters(tau)
                 return self
@@ -1434,14 +1692,16 @@ class Bicop:
 
             res = golden_section_maximize(obj1, a=a, b=b, x0=float(x0[0].item()))
             self.parameters = torch.tensor([float(res.x.item())], dtype=torch.float64)
+            self._fit_loglik = res.fun
             return self
 
         res = coordinate_descent_maximize(obj_vec, x0=x0, lb=lb, ub=ub)
         self.parameters = res.x.detach().clone()
+        self._fit_loglik = res.fun
         return self
 
     def select(self, data: torch.Tensor, controls: FitControlsBicop | None = None) -> "Bicop":
-        # Port of vinecopulib::tools_select::create_candidate_bicops() + fit/criterion.
+        # Optimized port: precompute shared quantities once, then evaluate each candidate cheaply.
         if controls is None:
             controls = FitControlsBicop()
 
@@ -1460,7 +1720,7 @@ class Bicop:
                 if not fams:
                     raise RuntimeError("No family with method itau provided")
 
-        # Dependence sign on raw data (unrotated), used for valid rotation set.
+        # Precompute tau ONCE on unrotated data — derive rotated tau by sign flip.
         tau0 = stats.kendall_tau(data[:, 0], data[:, 1], weights=controls.weights)
         which_rot = (0, 180) if (tau0 > 0.0) else (90, 270)
 
@@ -1486,8 +1746,7 @@ class Bicop:
             else:
                 m1 = (x1 < 0) & (x2 > 0)
                 m2 = (x1 > 0) & (x2 < 0)
-            # Port of vinecopulib::tools_select::get_c1c2():
-            # it (oddly) computes correlation on count-1 rows.
+
             def _c_on_mask(mask: torch.Tensor) -> float:
                 if not bool(mask.any()):
                     return 0.0
@@ -1541,16 +1800,63 @@ class Bicop:
 
             candidates = [c for c in candidates if keep(c)]
 
+        # Precompute rotated data for each distinct rotation (avoid recomputation).
+        u_clamped = stats.clamp_unit(data[:, :2])
+        rotated_cache: dict[int, torch.Tensor] = {}
+        for cand in candidates:
+            r = int(cand.rotation)
+            if r not in rotated_cache:
+                rotated_cache[r] = _rotate_data_like_vinecopulib(u_clamped, r)
+
+        # Precompute tau for each rotation: for rotation 90/270, tau flips sign; for 0/180 it stays.
+        tau_for_rot: dict[int, float] = {}
+        for r in rotated_cache:
+            if r in (90, 270):
+                tau_for_rot[r] = -tau0
+            else:
+                tau_for_rot[r] = tau0
+
         best = None
         best_score = -float("inf")
         n_eff = float(data.shape[0])
+        method = controls.parametric_method
 
         for cand in candidates:
             try:
-                cand.fit(data, controls)
-                ll = cand.loglik(data, weights=controls.weights)
+                rot = int(cand.rotation)
+                cand.nobs = int(data.shape[0])
+                u_rot = rotated_cache[rot]
+                tau = tau_for_rot[rot]
+
+                if cand.family == BicopFamily.indep:
+                    cand.parameters = torch.empty((0,), dtype=torch.float64)
+                    ll = 0.0
+                elif cand.family == BicopFamily.tll:
+                    cand.fit(data, controls)
+                    ll = cand._fit_loglik if cand._fit_loglik is not None else cand.loglik(data, weights=controls.weights)
+                elif method == "itau" and cand.family in _ITAU_FAMILIES:
+                    if cand.family == BicopFamily.student:
+                        # Student-t needs profile optimization for nu; use full fit
+                        cand.fit(data, controls)
+                        ll = cand._fit_loglik if cand._fit_loglik is not None else cand.loglik(data, weights=controls.weights)
+                    else:
+                        # Fast path: tau_to_parameters + loglik in one pass
+                        cand.parameters = cand.tau_to_parameters(tau)
+                        # Compute loglik directly on pre-rotated data to avoid re-rotating
+                        pdf_vals = cand._pdf0(u_rot)
+                        pdf_vals = pdf_vals.clamp_min(torch.finfo(pdf_vals.dtype).tiny)
+                        lp = torch.log(pdf_vals)
+                        if controls.weights is not None and controls.weights.numel() > 0:
+                            w = torch.as_tensor(controls.weights, dtype=lp.dtype, device=lp.device)
+                            lp = lp * w
+                        lp = lp[torch.isfinite(lp)]
+                        ll = float(lp.sum().item())
+                else:
+                    cand.fit(data, controls)
+                    ll = cand._fit_loglik if cand._fit_loglik is not None else cand.loglik(data, weights=controls.weights)
+
                 npars = cand.get_npars()
-            except NotImplementedError:
+            except (NotImplementedError, Exception):
                 continue
 
             # Convert criterion to a "score" to maximize.
@@ -1576,4 +1882,5 @@ class Bicop:
         self.rotation = best.rotation
         self.parameters = best.parameters
         self._interp_grid = best._interp_grid
+        self._fit_loglik = best_score  # cache the best score
         return self

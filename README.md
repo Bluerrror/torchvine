@@ -1,6 +1,6 @@
 # torchvine
 
-**Pure-PyTorch vine copula modelling — GPU-ready, differentiable, and API-compatible with [pyvinecopulib](https://github.com/vinecopulib/pyvinecopulib).**
+**Pure-PyTorch vine copula modelling — GPU-ready, differentiable, and fully API-compatible with [pyvinecopulib](https://github.com/vinecopulib/pyvinecopulib).**
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -8,7 +8,7 @@
 
 ---
 
-## Features
+## Why torchvine?
 
 | | torchvine | pyvinecopulib |
 |---|---|---|
@@ -16,7 +16,9 @@
 | **Differentiable** | ✅ Autograd-compatible | ❌ |
 | **GPU acceleration** | ✅ CUDA tensors | ❌ CPU only |
 | **API** | Drop-in replacement | Reference |
-| **Copula families** | 12 (all except Student-t) | 13 |
+| **Copula families** | 13 (full parity) | 13 |
+
+**Zero C/C++ dependencies** — everything is implemented in pure PyTorch, making it easy to install, debug, and extend.
 
 ### Supported Copula Families
 
@@ -24,6 +26,7 @@
 |--------|-----------|------|
 | Independence | 0 | — |
 | Gaussian | 1 (ρ) | Elliptical |
+| Student-t | 2 (ρ, ν) | Elliptical |
 | Clayton | 1 (θ) | Archimedean |
 | Gumbel | 1 (θ) | Archimedean / Extreme-value |
 | Frank | 1 (θ) | Archimedean |
@@ -48,7 +51,7 @@ pip install torchvine
 **From source:**
 
 ```bash
-git clone https://github.com/bluerror2710/torchvine.git
+git clone https://github.com/Bluerrror/torchvine.git
 cd torchvine
 pip install -e .
 ```
@@ -66,7 +69,7 @@ import torch
 import torchvine as tv
 
 # Create a Gaussian copula with correlation 0.7
-cop = tv.Bicop("gaussian", parameters=torch.tensor([0.7]))
+cop = tv.Bicop(tv.BicopFamily.gaussian, parameters=torch.tensor([0.7]))
 print(cop.str())               # <Bicop> family=gaussian, rotation=0, parameters=[0.7]
 print(cop.parameters_to_tau()) # Kendall's tau ≈ 0.494
 
@@ -75,8 +78,9 @@ u = torch.rand(1000, 2, dtype=torch.float64)
 pdf_vals = cop.pdf(u)
 samples  = cop.simulate(1000)
 
-# Fit from data
-fitted = tv.Bicop.select(samples)
+# Fit from data (automatic family selection)
+fitted = tv.Bicop()
+fitted.select(samples)
 print(fitted.str())
 ```
 
@@ -85,8 +89,8 @@ print(fitted.str())
 ```python
 # Fit a 5-dimensional vine copula
 data = torch.rand(500, 5, dtype=torch.float64)
-vine = tv.Vinecop.from_dimension(5)
-vine.select(data, controls=tv.FitControlsVinecop(parametric_method="itau"))
+vine = tv.Vinecop(d=5)
+vine.select(data, controls=tv.FitControlsVinecop(family_set=tv.parametric))
 
 print(vine.str())
 print(f"Log-likelihood: {vine.loglik(data):.2f}")
@@ -97,13 +101,41 @@ sim = vine.simulate(1000)
 pit = vine.rosenblatt(data)      # probability integral transform
 ```
 
+### Dependence Measures (wdm)
+
+```python
+x = torch.randn(1000, dtype=torch.float64)
+y = 0.6 * x + 0.8 * torch.randn(1000, dtype=torch.float64)
+
+# All five dependence measures — pure torch, no scipy/numpy
+print(tv.kendall_tau(x, y))    # Kendall's tau
+print(tv.spearman_rho(x, y))   # Spearman's rho
+print(tv.pearson_cor(x, y))    # Pearson correlation
+print(tv.blomqvist_beta(x, y)) # Blomqvist's beta
+print(tv.hoeffding_d(x, y))    # Hoeffding's D
+print(tv.wdm(x, y, "kendall")) # Unified interface
+```
+
+### 1-D Kernel Density Estimation
+
+```python
+data = torch.randn(500, dtype=torch.float64)
+kde = tv.Kde1d()
+kde.fit(data)
+
+pts = torch.linspace(-3, 3, 200, dtype=torch.float64)
+pdf = kde.pdf(pts)
+cdf = kde.cdf(pts)
+q   = kde.quantile(torch.tensor([0.025, 0.5, 0.975]))
+```
+
 ### GPU Acceleration
 
 ```python
 device = "cuda" if torch.cuda.is_available() else "cpu"
 u_gpu = torch.rand(10000, 2, dtype=torch.float64, device=device)
 
-cop = tv.Bicop("clayton", parameters=torch.tensor([3.0], device=device))
+cop = tv.Bicop(tv.BicopFamily.clayton, parameters=torch.tensor([3.0], device=device))
 pdf_gpu = cop.pdf(u_gpu)  # runs entirely on GPU
 ```
 
@@ -117,6 +149,7 @@ pdf_gpu = cop.pdf(u_gpu)  # runs entirely on GPU
 |-------|-------------|
 | `tv.Bicop` | Bivariate copula (create, fit, evaluate, simulate) |
 | `tv.Vinecop` | Vine copula model (select, pdf, simulate, rosenblatt) |
+| `tv.Kde1d` | 1-D kernel density estimation (fit, pdf, cdf, quantile, simulate) |
 | `tv.RVineStructure` | R-vine structure matrix |
 | `tv.DVineStructure` | D-vine structure (convenience subclass) |
 | `tv.CVineStructure` | C-vine structure (convenience subclass) |
@@ -138,7 +171,7 @@ Bicop(family, rotation=0, parameters=None, var_types=("c","c"))
 ### Vinecop Methods
 
 ```
-Vinecop.from_dimension(d)  |  Vinecop.from_structure(structure=, matrix=)
+Vinecop(d)  |  Vinecop(structure=)  |  Vinecop(matrix=)
   .select(data, controls)  .fit(data)
   .pdf(u)  .loglik(u)  .aic(u)  .bic(u)  .simulate(n)
   .rosenblatt(u)  .inverse_rosenblatt(u)  .cdf(u)
@@ -146,7 +179,24 @@ Vinecop.from_dimension(d)  |  Vinecop.from_structure(structure=, matrix=)
   .structure  .pair_copulas  .dim  .order  .npars
 ```
 
-### Module-Level Functions
+### Dependence Measures
+
+| Function | Description |
+|----------|-------------|
+| `tv.kendall_tau(x, y)` | Kendall's rank correlation |
+| `tv.spearman_rho(x, y)` | Spearman's rank correlation |
+| `tv.pearson_cor(x, y)` | Pearson linear correlation |
+| `tv.blomqvist_beta(x, y)` | Blomqvist's beta (medial correlation) |
+| `tv.hoeffding_d(x, y)` | Hoeffding's D statistic |
+| `tv.wdm(x, y, method)` | Unified interface for all measures |
+
+### Visualization
+
+| Function | Description |
+|----------|-------------|
+| `tv.pairs_copula_data(data)` | Pairs plot with copula density contours and Kendall's τ |
+
+### Utility Functions
 
 | Function | Description |
 |----------|-------------|
@@ -159,12 +209,12 @@ Vinecop.from_dimension(d)  |  Vinecop.from_structure(structure=, matrix=)
 
 ```python
 tv.one_par        # [gaussian, clayton, gumbel, frank, joe]
-tv.two_par        # [bb1, bb6, bb7, bb8]
+tv.two_par        # [student, bb1, bb6, bb7, bb8]
 tv.three_par      # [tawn]
 tv.parametric     # all parametric families
 tv.nonparametric  # [indep, tll]
 tv.archimedean    # [clayton, gumbel, frank, joe, bb1, bb6, bb7, bb8]
-tv.elliptical     # [gaussian]
+tv.elliptical     # [gaussian, student]
 tv.extreme_value  # [tawn, gumbel]
 tv.itau           # families supporting inverse-tau fitting
 tv.all            # all families
@@ -182,14 +232,15 @@ torchvine/
 │   ├── families.py          # BicopFamily enum
 │   ├── fit_controls.py      # FitControlsBicop / FitControlsVinecop
 │   ├── interpolation.py     # Grid interpolation for TLL
+│   ├── kde1d.py             # 1-D kernel density estimation
 │   ├── optimize.py          # Parameter optimization (MLE)
+│   ├── pair_copuladata.py   # Pairs copula data visualization
 │   ├── rvine_structure.py   # R-vine / D-vine / C-vine structures
-│   ├── stats.py             # Statistical helper functions
+│   ├── stats.py             # Statistical functions (wdm, tau, rho, etc.)
 │   ├── tll_fit.py           # Transformation local likelihood estimator
 │   ├── vine_select.py       # Vine structure & family selection
 │   └── vinecop.py           # Vine copula model
-├── tests/                   # Unit + cross-check tests (75 tests)
-├── benchmarks/              # Speed comparison vs pyvinecopulib
+├── tests/                   # Unit + cross-check tests
 ├── examples/                # Jupyter notebook tutorials
 ├── pyproject.toml
 ├── LICENSE                  # MIT
@@ -204,17 +255,10 @@ See the [`examples/`](examples/) directory for Jupyter notebooks:
 
 | Notebook | Topics |
 |----------|--------|
-| [01 — Getting Started](examples/01_getting_started.ipynb) | Imports, copula basics, simulation, fitting, vine copulas |
-| [02 — Bivariate Copulas](examples/02_bivariate_copulas.ipynb) | All families, rotations, parameter effects, TLL, model selection |
-| [03 — Vine Copulas](examples/03_vine_copulas.ipynb) | Vine fitting, structure, Rosenblatt transform, high-dimensional example |
-
----
-
-## Benchmarks
-
-Run `python benchmarks/run_benchmarks.py` to generate speed comparison plots against pyvinecopulib.
-
-Benchmarks cover: Bicop pdf/hfunc/simulate, Vinecop fit/pdf/simulate across multiple families and sample sizes.
+| [01 — Getting Started](examples/01_getting_started.ipynb) | Imports, copula basics, simulation, fitting |
+| [02 — Bivariate Copulas](examples/02_bivariate_copulas.ipynb) | All families, rotations, Student-t, model selection |
+| [03 — Vine Copulas](examples/03_vine_copulas.ipynb) | Vine fitting, structure, simulation, Rosenblatt transform |
+| [04 — Kde1d & Statistics](examples/04_kde1d_and_stats.ipynb) | KDE, dependence measures, pairs plot visualization |
 
 ---
 

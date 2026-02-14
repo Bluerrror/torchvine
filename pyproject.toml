@@ -41,9 +41,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/bluerror2710/torchvine"
-Repository = "https://github.com/bluerror2710/torchvine"
-Issues = "https://github.com/bluerror2710/torchvine/issues"
+Homepage = "https://github.com/Bluerrror/torchvine"
+Repository = "https://github.com/Bluerrror/torchvine"
+Issues = "https://github.com/Bluerrror/torchvine/issues"
 
 [tool.setuptools]
 package-dir = { "" = "." }

@@ -5,3 +5,8 @@ __pycache__/
 dist/
 build/
 .eggs/
+.ipynb_checkpoints/
+*.so
+*.dll
+.pytest_cache/
+.ruff_cache/

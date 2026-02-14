@@ -8,6 +8,7 @@ from enum import Enum
 class BicopFamily(str, Enum):
     indep = "indep"
     gaussian = "gaussian"
+    student = "student"
     clayton = "clayton"
     gumbel = "gumbel"
     frank = "frank"
@@ -23,6 +24,7 @@ class BicopFamily(str, Enum):
 _FAMILY_CAN_ROTATE = {
     BicopFamily.indep: False,
     BicopFamily.gaussian: False,
+    BicopFamily.student: False,
     BicopFamily.frank: False,
     BicopFamily.tll: False,
 }

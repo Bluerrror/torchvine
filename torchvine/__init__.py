@@ -11,6 +11,11 @@ from .fit_controls import FitControlsBicop, FitControlsVinecop
 from .rvine_structure import RVineStructure, DVineStructure, CVineStructure
 from .vinecop import Vinecop
 from .tll_fit import to_pseudo_obs
+from .kde1d import Kde1d
+from .pair_copuladata import pairs_copula_data
+from .stats import (
+    pearson_cor, kendall_tau, spearman_rho, blomqvist_beta, hoeffding_d, wdm,
+)
 
 import torch
 
@@ -96,6 +101,7 @@ def ghalton(
 # ---------------------------------------------------------------------------
 indep = BicopFamily.indep
 gaussian = BicopFamily.gaussian
+student = BicopFamily.student
 clayton = BicopFamily.clayton
 gumbel = BicopFamily.gumbel
 frank = BicopFamily.frank
@@ -109,23 +115,22 @@ tll = BicopFamily.tll
 
 # ---------------------------------------------------------------------------
 # Family convenience lists (mirrors pyvinecopulib module-level constants)
-# Note: student copula is intentionally excluded from this package.
 # ---------------------------------------------------------------------------
 one_par = [BicopFamily.gaussian, BicopFamily.clayton, BicopFamily.gumbel, BicopFamily.frank, BicopFamily.joe]
-two_par = [BicopFamily.bb1, BicopFamily.bb6, BicopFamily.bb7, BicopFamily.bb8]
+two_par = [BicopFamily.student, BicopFamily.bb1, BicopFamily.bb6, BicopFamily.bb7, BicopFamily.bb8]
 three_par = [BicopFamily.tawn]
 parametric = one_par + two_par + three_par
 nonparametric = [BicopFamily.indep, BicopFamily.tll]
-rotationless = [BicopFamily.indep, BicopFamily.gaussian, BicopFamily.frank, BicopFamily.tll]
+rotationless = [BicopFamily.indep, BicopFamily.gaussian, BicopFamily.student, BicopFamily.frank, BicopFamily.tll]
 archimedean = [BicopFamily.clayton, BicopFamily.gumbel, BicopFamily.frank, BicopFamily.joe,
                BicopFamily.bb1, BicopFamily.bb6, BicopFamily.bb7, BicopFamily.bb8]
-elliptical = [BicopFamily.gaussian]
+elliptical = [BicopFamily.gaussian, BicopFamily.student]
 extreme_value = [BicopFamily.tawn, BicopFamily.gumbel]
 bb = [BicopFamily.bb1, BicopFamily.bb6, BicopFamily.bb7, BicopFamily.bb8]
 lt = [BicopFamily.clayton, BicopFamily.bb1, BicopFamily.bb7, BicopFamily.tawn]
 ut = [BicopFamily.gumbel, BicopFamily.joe, BicopFamily.bb1, BicopFamily.bb6,
       BicopFamily.bb7, BicopFamily.bb8, BicopFamily.tawn]
-itau = [BicopFamily.indep, BicopFamily.gaussian, BicopFamily.clayton,
+itau = [BicopFamily.indep, BicopFamily.gaussian, BicopFamily.student, BicopFamily.clayton,
         BicopFamily.gumbel, BicopFamily.frank, BicopFamily.joe]
 all = list(BicopFamily)
 
@@ -139,14 +144,24 @@ __all__ = [
     "DVineStructure",
     "CVineStructure",
     "Vinecop",
+    "Kde1d",
+    "pairs_copula_data",
     "to_pseudo_obs",
     "get_device",
     "simulate_uniform",
     "sobol",
     "ghalton",
+    # Dependence measures
+    "pearson_cor",
+    "kendall_tau",
+    "spearman_rho",
+    "blomqvist_beta",
+    "hoeffding_d",
+    "wdm",
     # Individual family shortcut names
     "indep",
     "gaussian",
+    "student",
     "clayton",
     "gumbel",
     "frank",
