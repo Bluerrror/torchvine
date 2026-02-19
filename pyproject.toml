@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torchvine"
+version = "0.2.0"
+description = "Pure-PyTorch vine copula modelling — GPU-ready, differentiable, and API-compatible with pyvinecopulib"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+keywords = [
+    "copula", "vine-copula", "pytorch", "gpu", "statistics", "dependence-modeling",
+    "multivariate", "probability", "simulation", "deep-learning", "autograd",
+    "cuda", "pyvinecopulib", "bivariate-copula", "gaussian-copula",
+]
+authors = [
+  { name = "Bluerrror" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = [
+  "torch>=2.0",
+  "matplotlib>=3.5",
+  "pytorch-minimize",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pyvinecopulib>=0.6",
+  "nbformat>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Bluerrror/torchvine"
+Repository = "https://github.com/Bluerrror/torchvine"
+Issues = "https://github.com/Bluerrror/torchvine/issues"
+Changelog = "https://github.com/Bluerrror/torchvine/blob/master/CHANGELOG.md"
+
+[tool.setuptools]
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["torchvine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
