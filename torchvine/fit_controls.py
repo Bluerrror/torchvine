@@ -17,10 +17,13 @@ class FitControlsBicop:
     nonparametric_method: str = "constant"  # "constant", "linear", "quadratic"
     nonparametric_mult: float = 1.0
     selection_criterion: str = "bic"  # "loglik", "aic", "bic", "mbic"
+    tau_estimation: str = "auto"  # "auto", "exact", "approx"
     weights: torch.Tensor | None = None
     psi0: float = 0.9
     preselect_families: bool = True
     allow_rotations: bool = True
+    aggressive_fast_mle: bool = True  # use tau-parameterized fast MLE approximation for 1-parameter families
+    compute_fit_loglik: bool = False  # skip loglik evaluation in fit() when speed is preferred
     num_threads: int = 4  # parallel edge fitting threads (1 = sequential)
 
     def __post_init__(self):
@@ -32,10 +35,12 @@ class FitControlsBicop:
             raise ValueError("nonparametric_mult must be positive")
         if self.selection_criterion not in ("loglik", "aic", "bic", "mbic", "mbicv"):
             raise ValueError("selection_criterion must be one of 'loglik','aic','bic','mbic','mbicv'")
+        if self.tau_estimation not in ("auto", "exact", "approx"):
+            raise ValueError("tau_estimation must be one of 'auto','exact','approx'")
         if not (0.0 < float(self.psi0) < 1.0):
             raise ValueError("psi0 must be in (0,1)")
         if self.weights is not None:
-            self.weights = torch.as_tensor(self.weights, dtype=torch.float64)
+            self.weights = torch.as_tensor(self.weights)
 
     def str(self) -> str:
         """Human-readable summary (mirrors pyvinecopulib)."""
@@ -47,7 +52,10 @@ class FitControlsBicop:
             f"Nonparametric multiplier: {self.nonparametric_mult}",
             f"Weights: {'yes' if self.weights is not None else 'no'}",
             f"Selection criterion: {self.selection_criterion}",
+            f"Tau estimation: {self.tau_estimation}",
             f"Preselect families: {self.preselect_families}",
+            f"Aggressive fast MLE: {self.aggressive_fast_mle}",
+            f"Compute fit loglik: {self.compute_fit_loglik}",
             f"psi0: {self.psi0}",
             f"Number of threads: {self.num_threads}",
         ]
@@ -101,4 +109,3 @@ class FitControlsVinecop(FitControlsBicop):
             f"Tree algorithm: {self.tree_algorithm}",
         ]
         return "\n".join(parts)
-

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import bisect
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -17,6 +18,7 @@ from .optimize import (
     torch_maximize_1d_with_grad,
     torch_maximize_bounded,
     torch_maximize_bounded_with_grad,
+    torchmin_strict_enabled,
 )
 
 
@@ -32,6 +34,64 @@ _ITAU_FAMILIES = (
     BicopFamily.frank,
     BicopFamily.joe,
 )
+
+_FAST_MLE_1P_FAMILIES = (
+    BicopFamily.gaussian,
+    BicopFamily.clayton,
+    BicopFamily.gumbel,
+    BicopFamily.frank,
+    BicopFamily.joe,
+)
+
+_FRANK_TAU_GRID: list[float] | None = None
+_FRANK_THETA_GRID: list[float] | None = None
+_JOE_TAU_GRID: list[float] | None = None
+_JOE_THETA_GRID: list[float] | None = None
+
+
+def _interp_monotone(x: float, xs: list[float], ys: list[float]) -> float:
+    if x <= xs[0]:
+        return ys[0]
+    if x >= xs[-1]:
+        return ys[-1]
+    j = bisect.bisect_left(xs, x)
+    x0, x1 = xs[j - 1], xs[j]
+    y0, y1 = ys[j - 1], ys[j]
+    if x1 <= x0:
+        return y0
+    w = (x - x0) / (x1 - x0)
+    return y0 + w * (y1 - y0)
+
+
+def _init_frank_tau_inverse_grid() -> tuple[list[float], list[float]]:
+    global _FRANK_TAU_GRID, _FRANK_THETA_GRID
+    if _FRANK_TAU_GRID is not None and _FRANK_THETA_GRID is not None:
+        return _FRANK_TAU_GRID, _FRANK_THETA_GRID
+    thetas = [1e-4 + (40.0 - 1e-4) * i / 4095.0 for i in range(4096)]
+    taus: list[float] = []
+    for th in thetas:
+        t = 1.0 - 4.0 / th + 4.0 * _debye1(th) / th
+        taus.append(max(0.0, min(0.999999, float(t))))
+    _FRANK_TAU_GRID = taus
+    _FRANK_THETA_GRID = thetas
+    return taus, thetas
+
+
+def _init_joe_tau_inverse_grid() -> tuple[list[float], list[float]]:
+    global _JOE_TAU_GRID, _JOE_THETA_GRID
+    if _JOE_TAU_GRID is not None and _JOE_THETA_GRID is not None:
+        return _JOE_TAU_GRID, _JOE_THETA_GRID
+    thetas = [1.0 + 1e-6 + (30.0 - (1.0 + 1e-6)) * i / 4095.0 for i in range(4096)]
+    dg2 = float(torch.digamma(torch.tensor(2.0)).item())
+    taus: list[float] = []
+    for th in thetas:
+        tmp = 2.0 / th + 1.0
+        dig = dg2 - float(torch.digamma(torch.tensor(tmp)).item())
+        t = 1.0 + 2.0 * dig / (2.0 - th)
+        taus.append(max(0.0, min(0.999999, float(t))))
+    _JOE_TAU_GRID = taus
+    _JOE_THETA_GRID = thetas
+    return taus, thetas
 
 
 def _check_rotation(rotation: int):
@@ -261,6 +321,36 @@ def _winsorize_tau_like_vinecopulib(tau: float) -> float:
     return sign * at
 
 
+def _tau_approx_from_normal_scores(
+    u1: torch.Tensor,
+    u2: torch.Tensor,
+    *,
+    weights: torch.Tensor | None = None,
+) -> float:
+    z1 = stats.qnorm(stats.clamp_unit(u1))
+    z2 = stats.qnorm(stats.clamp_unit(u2))
+    rho = stats.pearson_cor(z1, z2, weights=weights)
+    rho = max(-0.999999, min(0.999999, float(rho)))
+    return float((2.0 / math.pi) * math.asin(rho))
+
+
+def _estimate_tau_for_fit(
+    u1: torch.Tensor,
+    u2: torch.Tensor,
+    controls: FitControlsBicop,
+) -> float:
+    mode = str(getattr(controls, "tau_estimation", "auto"))
+    w = controls.weights
+    if mode == "exact":
+        return stats.kendall_tau(u1, u2, weights=w)
+    if mode == "approx":
+        return _tau_approx_from_normal_scores(u1, u2, weights=w)
+    n = int(u1.numel())
+    if (w is None or w.numel() == 0) and n >= 800:
+        return _tau_approx_from_normal_scores(u1, u2, weights=None)
+    return stats.kendall_tau(u1, u2, weights=w)
+
+
 def _debye1(x: float) -> float:
     # Port of vinecopulib's debye1() in frank.ipp (double precision).
     if x <= 0.0:
@@ -363,7 +453,7 @@ def _debye1(x: float) -> float:
     return x * (s + 1.0 - x / 4.0)
 
 
-def _invert_monotone_1d(target: float, f: Callable[[float], float], *, lo: float, hi: float, max_iter: int = 50) -> float:
+def _invert_monotone_1d(target: float, f: Callable[[float], float], *, lo: float, hi: float, max_iter: int = 28) -> float:
     # Bisection inversion for monotone increasing f on [lo,hi].
     a = float(lo)
     b = float(hi)
@@ -429,6 +519,14 @@ class Bicop:
     _interp_grid: InterpolationGrid | None = field(default=None, init=False, repr=False)
     _fit_loglik: float | None = field(default=None, init=False, repr=False)
 
+    def to(self, *args, **kwargs) -> "Bicop":
+        """Move parameters and interpolation grid to device/dtype (in-place)."""
+        if self.parameters is not None:
+            self.parameters = self.parameters.to(*args, **kwargs)
+        if self._interp_grid is not None:
+            self._interp_grid = self._interp_grid.to(*args, **kwargs)
+        return self
+
     def __post_init__(self):
         self.family = normalize_family(self.family)
         _check_rotation(int(self.rotation))
@@ -436,9 +534,9 @@ class Bicop:
             raise ValueError(f"family {self.family} does not support rotation")
         if self.parameters is None:
             if self.family == BicopFamily.tll:
-                self.parameters = torch.ones((30, 30), dtype=torch.float64)
+                self.parameters = torch.ones((30, 30))
             else:
-                self.parameters = torch.empty((0,), dtype=torch.float64)
+                self.parameters = torch.empty((0,))
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -451,7 +549,7 @@ class Bicop:
 
     def str(self) -> str:
         """Human-readable string representation (mirrors pyvinecopulib)."""
-        p = torch.as_tensor(self.parameters, dtype=torch.float64).reshape(-1)
+        p = torch.as_tensor(self.parameters).reshape(-1)
         pstr = ", ".join(f"{v:.4f}" for v in p.tolist()) if p.numel() > 0 and self.family != BicopFamily.tll else ""
         parts = [f"<torchvine.Bicop>"]
         parts.append(f"  family: {self.family.value}")
@@ -469,7 +567,7 @@ class Bicop:
         return Bicop(
             family=normalize_family(obj["family"]),
             rotation=int(obj.get("rotation", 0)),
-            parameters=torch.as_tensor(obj.get("parameters", []), dtype=torch.float64),
+            parameters=torch.as_tensor(obj.get("parameters", [])),
             var_types=tuple(obj.get("var_types", ["c", "c"])),
             nobs=int(obj.get("nobs", 0)),
         )
@@ -530,7 +628,7 @@ class Bicop:
 
         n = int(kwargs.pop("n", 80))
         device = kwargs.pop("device", "cpu")
-        dtype = kwargs.pop("dtype", torch.float64)
+        dtype = kwargs.pop("dtype", self.parameters.dtype if self.parameters is not None else torch.float64)
         title = kwargs.pop("title", f"{self.family.value} (rot={int(self.rotation)})")
 
         u1 = torch.linspace(1e-3, 1.0 - 1e-3, n, device=device, dtype=dtype)
@@ -589,7 +687,7 @@ class Bicop:
     def _prep_for_abstract(self, u: torch.Tensor) -> torch.Tensor:
         # Equivalent to C++ prep_for_abstract(): format + trim + rotate.
         u = self._format_data(u)
-        u = stats.clamp_unit(torch.as_tensor(u, dtype=torch.float64))
+        u = stats.clamp_unit(torch.as_tensor(u))
         return _rotate_data_like_vinecopulib(u, int(self.rotation))
 
     def as_continuous(self) -> "Bicop":
@@ -1341,7 +1439,7 @@ class Bicop:
         return out.clamp_min(torch.finfo(out.dtype).tiny)
 
     def cdf(self, u: torch.Tensor) -> torch.Tensor:
-        u = torch.as_tensor(u, dtype=torch.float64)
+        u = torch.as_tensor(u)
         if u.ndim != 2 or u.shape[1] < 2:
             raise ValueError("u must have at least 2 columns")
         u0 = stats.clamp_unit(u[:, :2])
@@ -1423,7 +1521,11 @@ class Bicop:
             raise AssertionError("unreachable")
         return out.clamp(0.0, 1.0)
 
-    def simulate(self, n: int, *, device=None, dtype=torch.float64, seeds=None) -> torch.Tensor:
+    def simulate(self, n: int, *, device=None, dtype=None, seeds=None) -> torch.Tensor:
+        if device is None:
+            device = self.parameters.device if self.parameters is not None else None
+        if dtype is None:
+            dtype = self.parameters.dtype if (self.parameters is not None and self.parameters.numel() > 0) else torch.float32
         # Basic simulation via inverse Rosenblatt for implemented families.
         if n <= 0:
             raise ValueError("n must be positive")
@@ -1450,7 +1552,7 @@ class Bicop:
             self.rotation = 90
         # Family-specific shape changes.
         if self.family == BicopFamily.tawn:
-            p = torch.as_tensor(self.parameters, dtype=torch.float64).reshape(-1)
+            p = torch.as_tensor(self.parameters).reshape(-1)
             if p.numel() >= 2:
                 p = p.clone()
                 p[0], p[1] = p[1], p[0]
@@ -1494,7 +1596,7 @@ class Bicop:
     def parameters_to_tau(self) -> float:
         # Mirrors Bicop::parameters_to_tau() including rotation sign flip.
         fam = self.family
-        p = torch.as_tensor(self.parameters, dtype=torch.float64).reshape(-1).detach().cpu().tolist()
+        p = torch.as_tensor(self.parameters).reshape(-1).detach().cpu().tolist()
         if fam == BicopFamily.indep:
             tau = 0.0
         elif fam == BicopFamily.gaussian:
@@ -1537,23 +1639,24 @@ class Bicop:
         # Mirrors Bicop::tau_to_parameters() for one-parameter families.
         fam = self.family
         t = float(tau)
+        dev = self.parameters.device
+        dt = self.parameters.dtype
         if fam == BicopFamily.gaussian:
-            return torch.tensor([math.sin(t * math.pi / 2.0)], dtype=torch.float64)
+            return torch.tensor([math.sin(t * math.pi / 2.0)], device=dev, dtype=dt)
         if fam == BicopFamily.student:
             rho = math.sin(t * math.pi / 2.0)
-            return torch.tensor([rho, 4.0], dtype=torch.float64)
+            return torch.tensor([rho, 4.0], device=dev, dtype=dt)
         if fam == BicopFamily.clayton:
             at = abs(t)
             th = 2.0 * at / max(1e-12, 1.0 - at)
-            return torch.tensor([min(max(th, 1e-10), 28.0)], dtype=torch.float64)
+            return torch.tensor([min(max(th, 1e-10), 28.0)], device=dev, dtype=dt)
         if fam == BicopFamily.gumbel:
             at = abs(t)
             th = 1.0 / max(1e-12, 1.0 - at)
-            return torch.tensor([min(max(th, 1.0), 50.0)], dtype=torch.float64)
+            return torch.tensor([min(max(th, 1.0), 50.0)], device=dev, dtype=dt)
         if fam == BicopFamily.frank:
             if abs(t) < 1e-12:
-                return torch.tensor([0.0], dtype=torch.float64)
-
+                return torch.tensor([0.0], device=dev, dtype=dt)
             def tau_of(theta: float) -> float:
                 ath = abs(theta)
                 if ath < 1e-5:
@@ -1563,61 +1666,55 @@ class Bicop:
 
             lo = -35.0 + 1e-6
             hi = 35.0 - 1e-5
-            # tau_of is monotone in theta; invert.
             th = _invert_monotone_1d(t, tau_of, lo=lo, hi=hi)
-            return torch.tensor([th], dtype=torch.float64)
+            return torch.tensor([th], device=dev, dtype=dt)
         if fam == BicopFamily.joe:
             at = abs(t)
-            # Cache digamma(2) as a constant
-            _DG2 = float(torch.digamma(torch.tensor(2.0)).item())
-
-            def tau_of(theta: float) -> float:
-                tmp = 2.0 / theta + 1.0
-                dig = _DG2 - float(torch.digamma(torch.tensor(tmp)).item())
-                return 1.0 + 2.0 * dig / (2.0 - theta)
-
-            lo = 1.0 + 1e-6
-            hi = 30.0 - 1e-6
-            th = _invert_monotone_1d(at, tau_of, lo=lo, hi=hi)
-            return torch.tensor([th], dtype=torch.float64)
+            taus, thetas = _init_joe_tau_inverse_grid()
+            th = _interp_monotone(at, taus, thetas)
+            return torch.tensor([th], device=dev, dtype=dt)
         if fam == BicopFamily.indep:
-            return torch.empty((0,), dtype=torch.float64)
+            return torch.empty((0,), device=dev, dtype=dt)
         raise NotImplementedError(f"tau_to_parameters not implemented for {fam}")
 
     def _get_parameter_bounds(self) -> tuple[torch.Tensor, torch.Tensor]:
         fam = self.family
+        dev = self.parameters.device
+        dt = self.parameters.dtype
         if fam == BicopFamily.indep:
-            return torch.empty((0,), dtype=torch.float64), torch.empty((0,), dtype=torch.float64)
+            return torch.empty((0,), device=dev, dtype=dt), torch.empty((0,), device=dev, dtype=dt)
         if fam == BicopFamily.gaussian:
-            return torch.tensor([-1.0], dtype=torch.float64), torch.tensor([1.0], dtype=torch.float64)
+            return torch.tensor([-1.0], device=dev, dtype=dt), torch.tensor([1.0], device=dev, dtype=dt)
         if fam == BicopFamily.student:
-            return torch.tensor([-1.0, 2.0], dtype=torch.float64), torch.tensor([1.0, 30.0], dtype=torch.float64)
+            return torch.tensor([-1.0, 2.0], device=dev, dtype=dt), torch.tensor([1.0, 30.0], device=dev, dtype=dt)
         if fam == BicopFamily.clayton:
-            return torch.tensor([1e-10], dtype=torch.float64), torch.tensor([28.0], dtype=torch.float64)
+            return torch.tensor([1e-10], device=dev, dtype=dt), torch.tensor([28.0], device=dev, dtype=dt)
         if fam == BicopFamily.gumbel:
-            return torch.tensor([1.0], dtype=torch.float64), torch.tensor([50.0], dtype=torch.float64)
+            return torch.tensor([1.0], device=dev, dtype=dt), torch.tensor([50.0], device=dev, dtype=dt)
         if fam == BicopFamily.frank:
-            return torch.tensor([-35.0], dtype=torch.float64), torch.tensor([35.0], dtype=torch.float64)
+            return torch.tensor([-35.0], device=dev, dtype=dt), torch.tensor([35.0], device=dev, dtype=dt)
         if fam == BicopFamily.joe:
-            return torch.tensor([1.0], dtype=torch.float64), torch.tensor([30.0], dtype=torch.float64)
+            return torch.tensor([1.0], device=dev, dtype=dt), torch.tensor([30.0], device=dev, dtype=dt)
         if fam == BicopFamily.bb1:
-            return torch.tensor([0.0, 1.0], dtype=torch.float64), torch.tensor([7.0, 7.0], dtype=torch.float64)
+            return torch.tensor([0.0, 1.0], device=dev, dtype=dt), torch.tensor([7.0, 7.0], device=dev, dtype=dt)
         if fam == BicopFamily.bb6:
-            return torch.tensor([1.0, 1.0], dtype=torch.float64), torch.tensor([6.0, 8.0], dtype=torch.float64)
+            return torch.tensor([1.0, 1.0], device=dev, dtype=dt), torch.tensor([6.0, 8.0], device=dev, dtype=dt)
         if fam == BicopFamily.bb7:
-            return torch.tensor([1.0, 0.01], dtype=torch.float64), torch.tensor([6.0, 25.0], dtype=torch.float64)
+            return torch.tensor([1.0, 0.01], device=dev, dtype=dt), torch.tensor([6.0, 25.0], device=dev, dtype=dt)
         if fam == BicopFamily.bb8:
-            return torch.tensor([1.0, 1e-4], dtype=torch.float64), torch.tensor([8.0, 1.0], dtype=torch.float64)
+            return torch.tensor([1.0, 1e-4], device=dev, dtype=dt), torch.tensor([8.0, 1.0], device=dev, dtype=dt)
         if fam == BicopFamily.tawn:
-            return torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64), torch.tensor([1.0, 1.0, 60.0], dtype=torch.float64)
+            return torch.tensor([0.0, 0.0, 1.0], device=dev, dtype=dt), torch.tensor([1.0, 1.0, 60.0], device=dev, dtype=dt)
         raise NotImplementedError(f"bounds not implemented for {fam}")
 
     def _get_start_parameters(self, tau: float) -> torch.Tensor:
         fam = self.family
+        dev = self.parameters.device
+        dt = self.parameters.dtype
         if fam == BicopFamily.gaussian:
-            return torch.tensor([math.sin(tau * math.pi / 2.0)], dtype=torch.float64)
+            return torch.tensor([math.sin(tau * math.pi / 2.0)], device=dev, dtype=dt)
         if fam == BicopFamily.student:
-            return torch.tensor([math.sin(tau * math.pi / 2.0), 4.0], dtype=torch.float64)
+            return torch.tensor([math.sin(tau * math.pi / 2.0), 4.0], device=dev, dtype=dt)
         if fam in (BicopFamily.clayton, BicopFamily.gumbel, BicopFamily.frank, BicopFamily.joe):
             return self.tau_to_parameters(tau)
         if fam in (BicopFamily.bb1, BicopFamily.bb6, BicopFamily.bb7, BicopFamily.bb8):
@@ -1628,7 +1725,7 @@ class Bicop:
             return lb + 0.5
         # Fallback: keep current parameters (if any), otherwise lower bound + eps.
         if torch.as_tensor(self.parameters).numel() > 0:
-            return torch.as_tensor(self.parameters, dtype=torch.float64).reshape(-1)
+            return torch.as_tensor(self.parameters, device=dev, dtype=dt).reshape(-1)
         lb, _ub = self._get_parameter_bounds()
         return lb + 0.1
 
@@ -1660,12 +1757,12 @@ class Bicop:
             hi_tau = min(tau + 0.1, 0.99)
             rho_lo = math.sin(lo_tau * math.pi / 2.0)
             rho_hi = math.sin(hi_tau * math.pi / 2.0)
-            lb = torch.tensor([max(rho_lo, -0.999), 2.01], dtype=torch.float64)
-            ub = torch.tensor([min(rho_hi, 0.999), 30.0], dtype=torch.float64)
+            lb = torch.tensor([max(rho_lo, -0.999), 2.01], device=dev, dtype=dt)
+            ub = torch.tensor([min(rho_hi, 0.999), 30.0], device=dev, dtype=dt)
 
         if fam == BicopFamily.tawn:
-            lb = torch.tensor([0.3, 0.3, 1.5], dtype=torch.float64)
-            ub = torch.tensor([1.0, 1.0, 7.0], dtype=torch.float64)
+            lb = torch.tensor([0.3, 0.3, 1.5], device=dev, dtype=dt)
+            ub = torch.tensor([1.0, 1.0, 7.0], device=dev, dtype=dt)
         return lb, ub
 
     def fit(self, data: torch.Tensor, controls: FitControlsBicop | None = None) -> "Bicop":
@@ -1674,14 +1771,15 @@ class Bicop:
         if controls is None:
             controls = FitControlsBicop()
 
-        data = torch.as_tensor(data, dtype=torch.float64)
+        data = torch.as_tensor(data)
         self.nobs = int(data.shape[0])
+        self.to(device=data.device, dtype=data.dtype)
         self._fit_loglik = None  # cached loglik from fitting
         if data.ndim != 2 or data.shape[1] < 2:
             raise ValueError("data must have shape (n, >=2)")
 
         if self.family == BicopFamily.indep:
-            self.parameters = torch.empty((0,), dtype=torch.float64)
+            self.parameters = torch.empty((0,), device=data.device, dtype=data.dtype)
             self._fit_loglik = 0.0
             return self
 
@@ -1695,22 +1793,23 @@ class Bicop:
                 weights=controls.weights,
                 grid_size=30,
             )
-            self.parameters = vals.detach()
-            self._interp_grid = interp
+            self.parameters = vals.detach().to(device=data.device, dtype=data.dtype)
+            self._interp_grid = interp.to(device=data.device, dtype=data.dtype)
             self._fit_loglik = float(_ll)
             return self
 
         # ---- Parametric fitting (port of ParBicop::fit) ----
         if controls.parametric_method == "itau" and self.family not in _ITAU_FAMILIES:
             raise ValueError(f"parametric_method='itau' not available for family {self.family}")
+        compute_fit_loglik = bool(getattr(controls, "compute_fit_loglik", False))
 
         # Kendall tau on rotated, formatted data (fits the rotated model).
         u_prepped = self._prep_for_abstract(data)
-        tau = stats.kendall_tau(u_prepped[:, 0], u_prepped[:, 1], weights=controls.weights)
+        tau = _estimate_tau_for_fit(u_prepped[:, 0], u_prepped[:, 1], controls)
 
         method = controls.parametric_method
         if self.family == BicopFamily.indep:
-            self.parameters = torch.empty((0,), dtype=torch.float64)
+            self.parameters = torch.empty((0,), device=data.device, dtype=data.dtype)
             self._fit_loglik = 0.0
             return self
 
@@ -1744,11 +1843,12 @@ class Bicop:
                     return lp.sum()
 
                 res = torch_maximize_1d_with_grad(obj_nu, a=2.01, b=30.0, x0=4.0)
-                self.parameters = torch.tensor([rho, float(res.x)], dtype=torch.float64)
-                self._fit_loglik = res.fun
+                self.parameters = torch.tensor([rho, float(res.x)], device=dev, dtype=dt)
+                self._fit_loglik = float(res.fun) if compute_fit_loglik else None
                 return self
             if self.family in (BicopFamily.gaussian, BicopFamily.clayton, BicopFamily.gumbel, BicopFamily.frank, BicopFamily.joe):
                 self.parameters = self.tau_to_parameters(tau)
+                self._fit_loglik = self.loglik(data, weights=controls.weights) if compute_fit_loglik else None
                 return self
             raise NotImplementedError(f"itau not implemented for family {self.family}")
 
@@ -1758,6 +1858,15 @@ class Bicop:
         lb, ub = self._adjust_bounds_like_vinecopulib(lb, ub, tau=tau, method="mle")
         x0 = self._get_start_parameters(tau_w)
         x0 = torch.max(torch.min(x0, ub), lb)
+
+        # Aggressive fast-MLE mode:
+        # use tau-parameterized estimate as MLE approximation for 1-parameter families.
+        if controls.aggressive_fast_mle and self.family in _FAST_MLE_1P_FAMILIES:
+            p_fast = self.tau_to_parameters(tau)
+            p_fast = torch.max(torch.min(torch.as_tensor(p_fast).reshape(-1), ub), lb)
+            self.parameters = p_fast
+            self._fit_loglik = self.loglik(data, weights=controls.weights) if compute_fit_loglik else None
+            return self
 
         # Fast closed-form Gaussian copula MLE.
         if self.family == BicopFamily.gaussian:
@@ -1776,15 +1885,15 @@ class Bicop:
                 z1 = z[:, 0] - z[:, 0].mean()
                 z2 = z[:, 1] - z[:, 1].mean()
                 rho = ((z1 * z2).mean() / torch.sqrt((z1 * z1).mean().clamp_min(1e-20) * (z2 * z2).mean().clamp_min(1e-20))).clamp(-0.999, 0.999)
-            self.parameters = torch.tensor([float(rho.item())], dtype=torch.float64)
-            self._fit_loglik = self.loglik(data, weights=controls.weights)
+            self.parameters = torch.tensor([float(rho.item())], device=dev, dtype=dt)
+            self._fit_loglik = self.loglik(data, weights=controls.weights) if compute_fit_loglik else None
             return self
 
         # Fast one-parameter MLE: tau init + short bounded autograd refinement.
         if self.family in (BicopFamily.clayton, BicopFamily.gumbel, BicopFamily.frank, BicopFamily.joe):
             try:
                 p0 = self.tau_to_parameters(tau)
-                p0 = torch.max(torch.min(torch.as_tensor(p0, dtype=torch.float64), ub), lb)
+                p0 = torch.max(torch.min(torch.as_tensor(p0), ub), lb)
                 u_fit_fast = self._prep_for_abstract(data)[:, :2]
                 w_fit_fast = controls.weights
 
@@ -1802,7 +1911,8 @@ class Bicop:
                     self._fit_loglik = res_fast.fun
                     return self
             except Exception:
-                pass
+                if torchmin_strict_enabled():
+                    raise
 
         # ---------- Student-t: fast profile approach using Hill qt approximation ----------
         # Strategy: use _qt_hill (84x faster than full qt) for all optimization calls,
@@ -1838,14 +1948,14 @@ class Bicop:
                 return log_c[torch.isfinite(log_c)].sum()
 
             # Pass 1: optimize nu with rho fixed at tau-based estimate
-            rho0_t = torch.tensor(rho0, dtype=torch.float64)
+            rho0_t = torch.tensor(rho0, dtype=dt, device=dev)
 
             def obj_nu(nu_t: torch.Tensor) -> torch.Tensor:
                 return _fast_student_ll(rho0_t, nu_t)
 
             res_nu = torch_maximize_1d_with_grad(obj_nu, a=nu_lo, b=nu_hi, x0=nu0, max_iter=24)
             nu_opt = float(res_nu.x.item())
-            nu_opt_t = torch.tensor(nu_opt, dtype=torch.float64)
+            nu_opt_t = torch.tensor(nu_opt, dtype=dt, device=dev)
 
             # Pass 2: optimize rho with nu fixed
             def obj_rho(rho_t: torch.Tensor) -> torch.Tensor:
@@ -1853,7 +1963,7 @@ class Bicop:
 
             res_rho = torch_maximize_1d_with_grad(obj_rho, a=rho_lo, b=rho_hi, x0=rho0, max_iter=24)
             rho_opt = float(res_rho.x.item())
-            rho_opt_t = torch.tensor(rho_opt, dtype=torch.float64)
+            rho_opt_t = torch.tensor(rho_opt, dtype=dt, device=dev)
 
             # Pass 3: refine nu with optimal rho
             def obj_nu2(nu_t: torch.Tensor) -> torch.Tensor:
@@ -1862,7 +1972,7 @@ class Bicop:
             res2 = torch_maximize_1d_with_grad(obj_nu2, a=nu_lo, b=nu_hi, x0=nu_opt, max_iter=24)
             nu_final = float(res2.x.item())
 
-            self.parameters = torch.tensor([rho_opt, nu_final], dtype=torch.float64)
+            self.parameters = torch.tensor([rho_opt, nu_final], device=dev, dtype=dt)
             # Final accurate loglik using full qt
             self._fit_loglik = self.loglik(data, weights=w_student)
             return self
@@ -1897,15 +2007,16 @@ class Bicop:
                         self._fit_loglik = res.fun
                         return self
                 except Exception:
-                    pass
+                    if torchmin_strict_enabled():
+                        raise
 
             # Fallback: black-box 1D search.
             def obj1(v: float) -> float:
-                self.parameters = torch.tensor([float(v)], dtype=torch.float64)
+                self.parameters = torch.tensor([float(v)], device=dev, dtype=dt)
                 return self.loglik(data, weights=controls.weights)
 
             res = torch_maximize_1d(obj1, a=a, b=b, x0=float(x0[0].item()))
-            self.parameters = torch.tensor([float(res.x.item())], dtype=torch.float64)
+            self.parameters = torch.tensor([float(res.x.item())], device=dev, dtype=dt)
             self._fit_loglik = res.fun
             return self
 
@@ -1914,7 +2025,7 @@ class Bicop:
         w_fit = controls.weights
 
         def obj_vec_grad(pars: torch.Tensor) -> torch.Tensor:
-            self.parameters = torch.as_tensor(pars, dtype=torch.float64).reshape(-1)
+            self.parameters = torch.as_tensor(pars, device=dev, dtype=dt).reshape(-1)
             pdf_v = self._pdf0(u_fit)
             lp = torch.log(pdf_v.clamp_min(1e-300))
             if w_fit is not None and w_fit.numel() > 0:
@@ -1924,8 +2035,10 @@ class Bicop:
         try:
             res = torch_maximize_bounded_with_grad(obj_vec_grad, x0=x0, lb=lb, ub=ub, max_iter=32)
         except Exception:
+            if torchmin_strict_enabled():
+                raise
             def obj_vec(pars: torch.Tensor) -> float:
-                self.parameters = torch.as_tensor(pars, dtype=torch.float64).reshape(-1)
+                self.parameters = torch.as_tensor(pars, device=dev, dtype=dt).reshape(-1)
                 return self.loglik(data, weights=controls.weights)
 
             res = torch_maximize_bounded(obj_vec, x0=x0, lb=lb, ub=ub)
@@ -1938,8 +2051,9 @@ class Bicop:
         if controls is None:
             controls = FitControlsBicop()
 
-        data = torch.as_tensor(data, dtype=torch.float64)
+        data = torch.as_tensor(data)
         self.nobs = int(data.shape[0])
+        self.to(device=data.device, dtype=data.dtype)
         if data.ndim != 2 or data.shape[1] < 2:
             raise ValueError("data must have shape (n, >=2)")
 
@@ -1954,7 +2068,7 @@ class Bicop:
                     raise RuntimeError("No family with method itau provided")
 
         # Precompute tau ONCE on unrotated data — derive rotated tau by sign flip.
-        tau0 = stats.kendall_tau(data[:, 0], data[:, 1], weights=controls.weights)
+        tau0 = _estimate_tau_for_fit(data[:, 0], data[:, 1], controls)
         which_rot = (0, 180) if (tau0 > 0.0) else (90, 270)
 
         candidates: list[Bicop] = []
@@ -2062,7 +2176,7 @@ class Bicop:
                 tau = tau_for_rot[rot]
 
                 if cand.family == BicopFamily.indep:
-                    cand.parameters = torch.empty((0,), dtype=torch.float64)
+                    cand.parameters = torch.empty((0,), device=data.device, dtype=data.dtype)
                     ll = 0.0
                 elif cand.family == BicopFamily.tll:
                     cand.fit(data, controls)
@@ -2084,6 +2198,17 @@ class Bicop:
                             lp = lp * w
                         lp = lp[torch.isfinite(lp)]
                         ll = float(lp.sum().item())
+                elif method == "mle" and controls.aggressive_fast_mle and cand.family in _FAST_MLE_1P_FAMILIES:
+                    # Fast MLE approximation for 1-parameter families: tau-parameterized estimate + direct loglik.
+                    cand.parameters = cand.tau_to_parameters(tau)
+                    pdf_vals = cand._pdf0(u_rot)
+                    pdf_vals = pdf_vals.clamp_min(torch.finfo(pdf_vals.dtype).tiny)
+                    lp = torch.log(pdf_vals)
+                    if controls.weights is not None and controls.weights.numel() > 0:
+                        w = torch.as_tensor(controls.weights, dtype=lp.dtype, device=lp.device)
+                        lp = lp * w
+                    lp = lp[torch.isfinite(lp)]
+                    ll = float(lp.sum().item())
                 else:
                     cand.fit(data, controls)
                     ll = cand._fit_loglik if cand._fit_loglik is not None else cand.loglik(data, weights=controls.weights)

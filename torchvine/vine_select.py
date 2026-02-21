@@ -223,7 +223,7 @@ def _criterion_wdm(x: torch.Tensor, y: torch.Tensor, method: str, weights: torch
     def _rank_1_to_n(v: torch.Tensor) -> torch.Tensor:
         # Returns 1..n ranks (ties deterministically broken by stable sort order).
         # This is fully torch-native and works on GPU.
-        v = torch.as_tensor(v, dtype=torch.float64)
+        v = torch.as_tensor(v)
         idx = torch.argsort(v, stable=True)
         inv = torch.empty_like(idx)
         inv[idx] = torch.arange(int(v.numel()), device=v.device, dtype=idx.dtype)
@@ -231,8 +231,8 @@ def _criterion_wdm(x: torch.Tensor, y: torch.Tensor, method: str, weights: torch
 
     def _spearman_rho(xx: torch.Tensor, yy: torch.Tensor, ww: torch.Tensor | None) -> float:
         # Spearman's rho = Pearson correlation of ranks.
-        rx = _rank_1_to_n(xx).to(torch.float64)
-        ry = _rank_1_to_n(yy).to(torch.float64)
+        rx = _rank_1_to_n(xx).to(xx.dtype)
+        ry = _rank_1_to_n(yy).to(yy.dtype)
         return float(stats.pearson_cor(rx, ry, weights=ww))
 
     def _hoeffding_d_approx(xx: torch.Tensor, yy: torch.Tensor) -> float:
@@ -246,8 +246,8 @@ def _criterion_wdm(x: torch.Tensor, y: torch.Tensor, method: str, weights: torch
         if n < 20:
             return 0.0
 
-        R = _rank_1_to_n(xx).to(torch.float64)
-        S = _rank_1_to_n(yy).to(torch.float64)
+        R = _rank_1_to_n(xx).to(xx.dtype)
+        S = _rank_1_to_n(yy).to(yy.dtype)
         u = (R - 0.5) / float(n)
         v = (S - 0.5) / float(n)
 
@@ -257,7 +257,7 @@ def _criterion_wdm(x: torch.Tensor, y: torch.Tensor, method: str, weights: torch
         by = torch.clamp((v * float(B)).to(torch.int64), 0, B - 1)
         idx = bx * B + by
 
-        counts = torch.bincount(idx, minlength=B * B).reshape(B, B).to(torch.float64)
+        counts = torch.bincount(idx, minlength=B * B).reshape(B, B).to(xx.dtype)
         cdf = counts.cumsum(dim=0).cumsum(dim=1) / float(n)
         cn = cdf[bx, by]
         d = 30.0 * torch.mean((cn - (u * v)) ** 2)
@@ -273,7 +273,7 @@ def _criterion_wdm(x: torch.Tensor, y: torch.Tensor, method: str, weights: torch
 
 def _calculate_criterion(pc_data: torch.Tensor, name: str, weights: torch.Tensor | None) -> float:
     # Port of vinecopulib::tools_select::calculate_criterion()
-    xy = torch.as_tensor(pc_data, dtype=torch.float64)
+    xy = torch.as_tensor(pc_data)
     xy2, w2, freq = _remove_nans_2d(xy, weights)
     if xy2.shape[0] <= 10:
         return 0.0
@@ -412,7 +412,7 @@ def _random_spanning_tree_wilson(graph: _Graph, *, weighted: bool, seed: int = 0
                 wts.append(0.0)
             else:
                 wts.append(1.0 / (float(e.weight) + 1e-10))
-        probs = torch.tensor(wts, dtype=torch.float64)
+        probs = torch.tensor(wts, device=xx.device, dtype=xx.dtype)
         s = float(probs.sum().item())
         if s <= 0.0:
             j = int(torch.randint(low=0, high=len(nbrs), size=(1,), generator=rng).item())
@@ -463,7 +463,7 @@ class VinecopSelectorTorch:
     ):
         # Data can be n x d (all continuous) or include a second block for left-limits
         # for discrete variables (n x 2d) or (n x (d + k)).
-        self.data_raw = torch.as_tensor(data, dtype=torch.float64)
+        self.data_raw = torch.as_tensor(data)
         self.controls = controls
         self.var_types = var_types
         self.d = int(len(var_types))
@@ -478,7 +478,7 @@ class VinecopSelectorTorch:
 
     def _format_data(self, u: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # Mirrors vinecopulib data layout for discrete variables.
-        u = torch.as_tensor(u, dtype=torch.float64)
+        u = torch.as_tensor(u)
         if u.ndim != 2:
             raise ValueError("data must be 2D")
         n = int(u.shape[0])
@@ -629,7 +629,7 @@ class VinecopSelectorTorch:
             e.var_types = (v0.var_types[1 - pos0], v1.var_types[1 - pos1])
 
             n = int(v0.hfunc1.numel()) if v0.hfunc1 is not None else 0
-            pc = torch.empty((n, 2), dtype=torch.float64, device=(v0.hfunc1.device if v0.hfunc1 is not None else None))
+            pc = torch.empty((n, 2), dtype=v0.hfunc1.dtype, device=v0.hfunc1.device)
             pc[:, 0] = _get_hfunc(v0, pos0 == 0)
             pc[:, 1] = _get_hfunc(v1, pos1 == 0)
             if (e.var_types[0] == "d") or (e.var_types[1] == "d"):

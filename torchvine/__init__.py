@@ -5,7 +5,7 @@ GPU-ready, differentiable, and API-compatible with pyvinecopulib.
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.2.2"
 
 from .families import BicopFamily
 from .bicop import Bicop
@@ -59,12 +59,12 @@ def simulate_uniform(
     d = int(d)
     if qrng:
         eng = torch.quasirandom.SobolEngine(dimension=d, scramble=True, seed=int(seeds[0]) if seeds else 0)
-        return eng.draw(n).to(torch.float64)
+        return eng.draw(n)
     g = None
     if seeds:
         g = torch.Generator()
         g.manual_seed(int(seeds[0]))
-    return torch.rand((n, d), generator=g, dtype=torch.float64)
+    return torch.rand((n, d), generator=g)
 
 
 def sobol(
@@ -79,7 +79,7 @@ def sobol(
     eng = torch.quasirandom.SobolEngine(
         dimension=int(d), scramble=True, seed=int(seeds[0]) if seeds else 0,
     )
-    return eng.draw(int(n)).to(torch.float64)
+    return eng.draw(int(n))
 
 
 def ghalton(
@@ -95,7 +95,7 @@ def ghalton(
     eng = torch.quasirandom.SobolEngine(
         dimension=int(d), scramble=True, seed=int(seeds[0]) if seeds else 1,
     )
-    return eng.draw(int(n)).to(torch.float64)
+    return eng.draw(int(n))
 
 
 # ---------------------------------------------------------------------------

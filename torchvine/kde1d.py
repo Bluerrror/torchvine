@@ -94,8 +94,8 @@ class Kde1d:
         type: str = "continuous",
     ) -> "Kde1d":
         """Construct directly from pre-computed grid and PDF values."""
-        grid_t = torch.as_tensor(grid_points, dtype=torch.float64).reshape(-1)
-        pdf_t = torch.as_tensor(values, dtype=torch.float64).reshape(-1)
+        grid_t = torch.as_tensor(grid_points).reshape(-1)
+        pdf_t = torch.as_tensor(values).reshape(-1)
         obj = cls(xmin=xmin, xmax=xmax, type=type, grid_size=grid_t.numel() - 1)
         obj._grid_t = grid_t
         obj._pdf_t = pdf_t
@@ -114,7 +114,7 @@ class Kde1d:
     # ------------------------------------------------------------------
     def fit(self, x) -> "Kde1d":
         """Fit the density to data *x* (1-D array or tensor)."""
-        x = torch.as_tensor(x, dtype=torch.float64).reshape(-1)
+        x = torch.as_tensor(x).reshape(-1)
         if self._type == "discrete":
             return self._fit_discrete(x)
         return self._fit_continuous(x)
@@ -208,13 +208,13 @@ class Kde1d:
         n = x.numel()
         self._nobs = n
         vals, counts = x.unique(sorted=True, return_counts=True)
-        probs = counts.to(torch.float64) / n
+        probs = counts.to(x.dtype) / n
 
         lb = vals[0].item()
         ub = vals[-1].item()
         G = int(ub - lb) + 1
-        grid = torch.linspace(lb, ub, G, dtype=torch.float64, device=x.device)
-        pdf_vals = torch.zeros(G, dtype=torch.float64, device=x.device)
+        grid = torch.linspace(lb, ub, G, dtype=x.dtype, device=x.device)
+        pdf_vals = torch.zeros(G, dtype=x.dtype, device=x.device)
         for v, p in zip(vals, probs):
             idx = int(v.item() - lb)
             if 0 <= idx < G:
@@ -250,19 +250,19 @@ class Kde1d:
     def pdf(self, x):
         """Evaluate the density at *x*."""
         self._check_fitted()
-        xt = torch.as_tensor(x, dtype=torch.float64).reshape(-1)
+        xt = torch.as_tensor(x).reshape(-1)
         return self._interp(xt, self._grid_t, self._pdf_t).clamp(min=0.0)
 
     def cdf(self, x):
         """Evaluate the CDF at *x*."""
         self._check_fitted()
-        xt = torch.as_tensor(x, dtype=torch.float64).reshape(-1)
+        xt = torch.as_tensor(x).reshape(-1)
         return self._interp(xt, self._grid_t, self._cdf_t).clamp(0.0, 1.0)
 
     def quantile(self, p):
         """Evaluate the quantile function at probability *p*."""
         self._check_fitted()
-        pt = torch.as_tensor(p, dtype=torch.float64).reshape(-1).clamp(0.0, 1.0)
+        pt = torch.as_tensor(p).reshape(-1).clamp(0.0, 1.0)
         idx = torch.searchsorted(self._cdf_t.contiguous(), pt.contiguous()).clamp(1, self._grid_t.numel() - 1)
         c0 = self._cdf_t[idx - 1]
         c1 = self._cdf_t[idx]
@@ -277,7 +277,7 @@ class Kde1d:
         self._check_fitted()
         if seeds is not None:
             torch.manual_seed(seeds[0] if isinstance(seeds, (list, tuple)) else int(seeds))
-        u = torch.rand(n, dtype=torch.float64)
+        u = torch.rand(n, dtype=self._grid_t.dtype, device=self._grid_t.device)
         return self.quantile(u)
 
     # ------------------------------------------------------------------

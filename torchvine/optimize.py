@@ -7,7 +7,7 @@ as the primary backend; otherwise robust pure-PyTorch fallbacks are used.
 from __future__ import annotations
 
 import math
-from contextlib import suppress
+import os
 from dataclasses import dataclass
 from typing import Callable
 
@@ -38,42 +38,65 @@ def _from_box(x: torch.Tensor, lb: torch.Tensor, ub: torch.Tensor) -> torch.Tens
     return torch.log(s) - torch.log1p(-s)
 
 
-def _try_pytorch_minimize(
+_TORCHMIN_MINIMIZE: Callable | None = None
+_TORCHMIN_LOAD_FAILED = False
+
+
+def torchmin_strict_enabled() -> bool:
+    """Whether gradient-based optimization must use pytorch-minimize only."""
+    return os.environ.get("TORCHVINE_REQUIRE_TORCHMIN", "1").strip().lower() not in {"0", "false", "no"}
+
+
+def _get_torchmin_minimize() -> Callable | None:
+    global _TORCHMIN_MINIMIZE, _TORCHMIN_LOAD_FAILED
+    if _TORCHMIN_MINIMIZE is not None:
+        return _TORCHMIN_MINIMIZE
+    if _TORCHMIN_LOAD_FAILED:
+        return None
+    try:
+        import torchmin as _torchmin  # type: ignore[import-not-found]
+    except ImportError:
+        try:
+            import pytorch_minimize as _torchmin  # type: ignore[import-not-found]
+        except ImportError:
+            _TORCHMIN_LOAD_FAILED = True
+            return None
+    fn = getattr(_torchmin, "minimize", None)
+    if callable(fn):
+        _TORCHMIN_MINIMIZE = fn
+        return fn
+    _TORCHMIN_LOAD_FAILED = True
+    return None
+
+
+def _run_torchmin(
     f_neg: Callable[[torch.Tensor], torch.Tensor],
     *,
     z0: torch.Tensor,
     max_iter: int,
     tol: float,
-) -> tuple[torch.Tensor, int] | None:
-    """Try using pytorch-minimize if available.
+) -> tuple[torch.Tensor, int]:
+    """Use pytorch-minimize (torchmin) as primary L-BFGS backend.
 
-    The package API differs by version; we support known entry points
-    opportunistically and return None when unavailable.
+    Raises when torchmin is unavailable or optimization fails.
     """
-    with suppress(Exception):
-        try:
-            import torchmin as _torchmin  # type: ignore[import-not-found]
-            fn = getattr(_torchmin, "minimize", None)
-        except Exception:
-            import pytorch_minimize as _pytorch_minimize  # type: ignore[import-not-found]
-            fn = getattr(_pytorch_minimize, "minimize", None)
-        if callable(fn):
-            # torchmin API: minimize(fun, x0, method, ...)
-            try:
-                res = fn(
-                    f_neg,
-                    z0.detach().clone(),
-                    method="l-bfgs",
-                    max_iter=max_iter,
-                    tol=tol,
-                )
-            except TypeError:
-                res = fn(f_neg, z0.detach().clone(), "l-bfgs")
-            x = getattr(res, "x", None)
-            nit = int(getattr(res, "nit", max_iter))
-            if x is not None and torch.is_tensor(x):
-                return x.detach().clone(), nit
-    return None
+    fn = _get_torchmin_minimize()
+    if fn is None:
+        raise RuntimeError("pytorch-minimize/torchmin is required but not installed")
+
+    res = fn(
+        f_neg,
+        z0.detach().clone(),
+        method="l-bfgs",
+        max_iter=max_iter,
+        tol=tol,
+    )
+
+    x = getattr(res, "x", None)
+    nit = int(getattr(res, "nit", max_iter))
+    if x is not None and torch.is_tensor(x):
+        return x.detach().clone(), nit
+    raise RuntimeError("torchmin minimize() did not return a tensor parameter vector")
 
 
 def _lbfgs_minimize(
@@ -114,9 +137,11 @@ def _torch_minimize_bounded_with_grad(
     max_iter: int = 100,
     tol: float = 1e-8,
 ) -> OptimizeResult:
-    x0 = torch.as_tensor(x0, dtype=torch.float64).reshape(-1)
-    lb = torch.as_tensor(lb, dtype=torch.float64).reshape(-1)
-    ub = torch.as_tensor(ub, dtype=torch.float64).reshape(-1)
+    x0 = torch.as_tensor(x0).reshape(-1)
+    lb = torch.as_tensor(lb).reshape(-1)
+    ub = torch.as_tensor(ub).reshape(-1)
+    dt = x0.dtype
+    dev = x0.device
     x0 = torch.max(torch.min(x0, ub), lb)
     z0 = _from_box(x0, lb, ub)
     n_eval = 0
@@ -127,9 +152,7 @@ def _torch_minimize_bounded_with_grad(
         x = _to_box(z, lb, ub)
         return -f_tensor(x)
 
-    z_opt, n_backend = _try_pytorch_minimize(f_neg, z0=z0, max_iter=max_iter, tol=tol) or _lbfgs_minimize(
-        f_neg, z0=z0, max_iter=max_iter, tol=tol
-    )
+    z_opt, n_backend = _run_torchmin(f_neg, z0=z0, max_iter=max_iter, tol=tol)
     x_opt = _to_box(z_opt, lb, ub)
     with torch.no_grad():
         best = float(f_tensor(x_opt).detach().cpu().item())
@@ -195,7 +218,7 @@ def golden_section_maximize(
     else:
         x = d
         fun = fd
-    return OptimizeResult(x=torch.tensor(float(x), dtype=torch.float64), fun=float(fun), n_eval=n_eval)
+    return OptimizeResult(x=torch.tensor(float(x)), fun=float(fun), n_eval=n_eval)
 
 
 def coordinate_descent_maximize(
@@ -209,9 +232,11 @@ def coordinate_descent_maximize(
     tol: float = 1e-8,
 ) -> OptimizeResult:
     """Derivative-free coordinate descent with 1D golden-section substeps."""
-    x = torch.as_tensor(x0, dtype=torch.float64).reshape(-1).clone()
-    lb = torch.as_tensor(lb, dtype=torch.float64).reshape(-1)
-    ub = torch.as_tensor(ub, dtype=torch.float64).reshape(-1)
+    x = torch.as_tensor(x0).reshape(-1).clone()
+    lb = torch.as_tensor(lb).reshape(-1)
+    ub = torch.as_tensor(ub).reshape(-1)
+    dt = x.dtype
+    dev = x.device
     if x.numel() != lb.numel() or x.numel() != ub.numel():
         raise ValueError("x0, lb, ub must have the same length")
     x = torch.max(torch.min(x, ub), lb)
@@ -267,11 +292,16 @@ def torch_maximize_1d_with_grad(
     tol: float = 1e-10,
     max_iter: int = 100,
 ) -> OptimizeResult:
-    lb = torch.tensor([float(a)], dtype=torch.float64)
-    ub = torch.tensor([float(b)], dtype=torch.float64)
+    dt = torch.float32
+    dev = None
+    # x0 is float, so we don't have a tensor to pull from yet. 
+    # But usually this is called from Bicop/Vinecop which have parameters.
+    # For now let's just use defaults if not provided.
+    lb = torch.tensor([float(a)], dtype=dt)
+    ub = torch.tensor([float(b)], dtype=dt)
     if x0 is None:
         x0 = 0.5 * (float(a) + float(b))
-    x0_t = torch.tensor([float(x0)], dtype=torch.float64)
+    x0_t = torch.tensor([float(x0)], dtype=dt)
 
     def f_vec(x: torch.Tensor) -> torch.Tensor:
         return f_tensor(x.reshape(-1)[0])

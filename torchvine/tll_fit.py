@@ -18,7 +18,7 @@ def to_pseudo_obs(x: torch.Tensor, *, ties_method: str = "average", seeds: Seque
 
     ties_method: 'average' or 'random' (random uses jitter for tie-breaking).
     """
-    x = torch.as_tensor(x, dtype=torch.float64)
+    x = torch.as_tensor(x)
     if x.ndim == 1:
         x = x.unsqueeze(1)
     n, d = x.shape
@@ -42,22 +42,22 @@ def to_pseudo_obs(x: torch.Tensor, *, ties_method: str = "average", seeds: Seque
 
 
 def _pearson_corr(x: torch.Tensor, y: torch.Tensor, weights: torch.Tensor | None) -> torch.Tensor:
-    x = torch.as_tensor(x, dtype=torch.float64)
-    y = torch.as_tensor(y, dtype=torch.float64)
+    x = torch.as_tensor(x)
+    y = torch.as_tensor(y)
     if weights is None:
         x0 = x - x.mean()
         y0 = y - y.mean()
-        den = torch.sqrt((x0 * x0).sum() * (y0 * y0).sum()).clamp_min(torch.finfo(torch.float64).tiny)
+        den = torch.sqrt((x0 * x0).sum() * (y0 * y0).sum()).clamp_min(torch.finfo(x.dtype).tiny)
         return (x0 * y0).sum() / den
-    w = torch.as_tensor(weights, dtype=torch.float64, device=x.device)
-    w = w / w.sum().clamp_min(torch.finfo(torch.float64).tiny)
+    w = torch.as_tensor(weights, device=x.device, dtype=x.dtype)
+    w = w / w.sum().clamp_min(torch.finfo(x.dtype).tiny)
     mx = (w * x).sum()
     my = (w * y).sum()
     x0 = x - mx
     y0 = y - my
     cov = (w * x0 * y0).sum()
-    vx = (w * x0 * x0).sum().clamp_min(torch.finfo(torch.float64).tiny)
-    vy = (w * y0 * y0).sum().clamp_min(torch.finfo(torch.float64).tiny)
+    vx = (w * x0 * x0).sum().clamp_min(torch.finfo(x.dtype).tiny)
+    vy = (w * y0 * y0).sum().clamp_min(torch.finfo(x.dtype).tiny)
     return cov / torch.sqrt(vx * vy)
 
 
@@ -65,7 +65,7 @@ def _win_smoother(x: torch.Tensor, wl: int) -> torch.Tensor:
     # Port of vinecopulib::tools_stats::win (moving average with edge flattening).
     if wl <= 0:
         return x
-    x = torch.as_tensor(x, dtype=torch.float64)
+    x = torch.as_tensor(x)
     n = x.numel()
     k = 2 * wl + 1
     kernel = torch.ones((1, 1, k), dtype=x.dtype, device=x.device) / float(k)
@@ -85,15 +85,17 @@ def _cef(x: torch.Tensor, order: torch.Tensor, inv_order: torch.Tensor, wl: int)
 
 def ace(data: torch.Tensor, *, weights: torch.Tensor | None = None) -> torch.Tensor:
     # Port of vinecopulib::tools_stats::ace for 2D data.
-    data = torch.as_tensor(data, dtype=torch.float64)
+    data = torch.as_tensor(data)
     n = int(data.shape[0])
     n_dbl = float(n)
+    dt = data.dtype
+    dev = data.device
 
     if weights is None or weights.numel() == 0:
-        w = torch.ones((n,), dtype=torch.float64, device=data.device)
+        w = torch.ones((n,), dtype=dt, device=dev)
         nw = 0
     else:
-        w = torch.as_tensor(weights, dtype=torch.float64, device=data.device)
+        w = torch.as_tensor(weights, dtype=dt, device=dev)
         if int(w.numel()) != n:
             raise ValueError("weights length must match number of rows")
         nw = n
@@ -108,7 +110,7 @@ def ace(data: torch.Tensor, *, weights: torch.Tensor | None = None) -> torch.Ten
     inv1 = torch.empty((n,), dtype=torch.long, device=data.device)
     inv1[order1] = torch.arange(n, device=data.device)
 
-    ranks = torch.stack([inv0.to(torch.float64), inv1.to(torch.float64)], dim=1)
+    ranks = torch.stack([inv0.to(dt), inv1.to(dt)], dim=1)
     phi = ranks.clone()
     phi = phi - ((n_dbl - 1.0) / 2.0 - 1.0)
     phi = phi / math.sqrt(n_dbl * (n_dbl - 1.0) / 12.0)
@@ -128,7 +130,7 @@ def ace(data: torch.Tensor, *, weights: torch.Tensor | None = None) -> torch.Ten
             phi[:, 1] = _cef(phi[:, 0] * w, order1, inv1, wl)
             m1 = phi[:, 1].sum() / n_dbl
             phi[:, 1] = phi[:, 1] - m1
-            s1 = torch.sqrt((phi[:, 1] * phi[:, 1]).sum() / (n_dbl - 1.0)).clamp_min(torch.finfo(torch.float64).tiny)
+            s1 = torch.sqrt((phi[:, 1] * phi[:, 1]).sum() / (n_dbl - 1.0)).clamp_min(torch.finfo(dt).tiny)
             phi[:, 1] = phi[:, 1] / s1
 
             inner_abs_err = inner_eps
@@ -140,7 +142,7 @@ def ace(data: torch.Tensor, *, weights: torch.Tensor | None = None) -> torch.Ten
         phi[:, 0] = _cef(phi[:, 1] * w, order0, inv0, wl)
         m0 = phi[:, 0].sum() / n_dbl
         phi[:, 0] = phi[:, 0] - m0
-        s0 = torch.sqrt((phi[:, 0] * phi[:, 0]).sum() / (n_dbl - 1.0)).clamp_min(torch.finfo(torch.float64).tiny)
+        s0 = torch.sqrt((phi[:, 0] * phi[:, 0]).sum() / (n_dbl - 1.0)).clamp_min(torch.finfo(dt).tiny)
         phi[:, 0] = phi[:, 0] / s0
 
         outer_abs_err = outer_eps
@@ -171,12 +173,14 @@ def fit_tll(
     if mult <= 0:
         raise ValueError("mult must be positive")
 
-    u = stats.clamp_unit(torch.as_tensor(data, dtype=torch.float64)[:, :2])
+    u = stats.clamp_unit(torch.as_tensor(data)[:, :2])
+    dt = u.dtype
+    dev = u.device
     ps = to_pseudo_obs(u, seeds=(5,))
     z_data = stats.qnorm(ps)
 
     m = int(grid_size)
-    grid_points = make_normal_grid(m, boundary_to_01=False, device=u.device, dtype=u.dtype)
+    grid_points = make_normal_grid(m, boundary_to_01=False, device=dev, dtype=dt)
     g0 = grid_points.repeat_interleave(m)
     g1 = grid_points.repeat(m)
     grid_2d = torch.stack([g0, g1], dim=1)
@@ -184,7 +188,7 @@ def fit_tll(
 
     # Bandwidth selection (ported; includes ACE-based mcor scaling).
     cor = _pearson_corr(z_data[:, 0], z_data[:, 1], weights=weights).clamp(-0.95, 0.95)
-    cov = torch.tensor([[1.0, float(cor.item())], [float(cor.item()), 1.0]], dtype=torch.float64, device=u.device)
+    cov = torch.tensor([[1.0, float(cor.item())], [float(cor.item()), 1.0]], dtype=dt, device=dev)
     n = float(z_data.shape[0])
     if method == "constant":
         mult0 = n ** (-1.0 / 3.0)
@@ -205,11 +209,11 @@ def fit_tll(
 
     w = None
     if weights is not None and weights.numel() > 0:
-        w = torch.as_tensor(weights, dtype=torch.float64, device=u.device)
+        w = torch.as_tensor(weights, device=u.device, dtype=u.dtype)
 
     n_eval = z_eval.shape[0]
     n_data = z_data2.shape[0]
-    kernel0 = stats.dnorm(torch.zeros((1, 2), dtype=torch.float64, device=u.device)).prod(dim=1)[0]
+    kernel0 = stats.dnorm(torch.zeros((1, 2), device=u.device, dtype=u.dtype)).prod(dim=1)[0]
 
     if method == "constant":
         # Fully vectorized: compute all kernel values at once
@@ -220,23 +224,23 @@ def fit_tll(
         kernels = stats.dnorm(diff).prod(dim=2) * det_irB
         if w is not None:
             kernels = kernels * w.unsqueeze(0)
-        f0 = kernels.mean(dim=1).clamp_min(torch.finfo(torch.float64).tiny)  # (n_eval,)
-
-        ll_fit = torch.empty((n_eval, 2), dtype=torch.float64, device=u.device)
+        f0 = kernels.mean(dim=1).clamp_min(torch.finfo(u.dtype).tiny)  # (n_eval,)
+        ll_fit = torch.empty((n_eval, 2), device=u.device, dtype=u.dtype)
+        
         ll_fit[:, 0] = f0
         ll_fit[:, 1] = kernel0 * det_irB * (1.0 / f0) / float(n_data)
     else:
         # linear/quadratic still per-grid-point (complex per-point operations)
-        ll_fit = torch.empty((n_eval, 2), dtype=torch.float64, device=u.device)
+        ll_fit = torch.empty((n_eval, 2), device=u.device, dtype=u.dtype)
         for k in range(n_eval):
             zz = z_data2 - z_eval[k, :]
             kernels = stats.dnorm(zz).prod(dim=1) * det_irB
             if w is not None:
                 kernels = kernels * w
-            f0 = kernels.mean().clamp_min(torch.finfo(torch.float64).tiny)
+            f0 = kernels.mean().clamp_min(torch.finfo(u.dtype).tiny)
 
             resk = 1.0
-            b = torch.zeros((2,), dtype=torch.float64, device=u.device)
+            b = torch.zeros((2,), device=u.device, dtype=u.dtype)
             S = B
             zz2 = (irB @ zz.t()).t()
             f1 = (zz2 * kernels[:, None]).mean(dim=0)
@@ -261,6 +265,6 @@ def fit_tll(
     interp = InterpolationGrid(grid2, values)
 
     npars = float(max(1.0, ll_fit[:, 1].sum().item()))
-    loglik = float(torch.log(interp.interpolate(u).clamp_min(torch.finfo(torch.float64).tiny)).sum().item())
+    loglik = float(torch.log(interp.interpolate(u).clamp_min(torch.finfo(u.dtype).tiny)).sum().item())
 
     return values, interp, loglik, npars

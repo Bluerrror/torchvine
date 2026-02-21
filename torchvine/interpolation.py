@@ -7,7 +7,7 @@ import torch
 from . import stats
 
 
-def make_normal_grid(m: int = 30, *, boundary_to_01: bool = True, device=None, dtype=torch.float64) -> torch.Tensor:
+def make_normal_grid(m: int = 30, *, boundary_to_01: bool = True, device=None, dtype=None) -> torch.Tensor:
     # Matches KernelBicop::make_normal_grid + boundary shift used by KernelBicop/TllBicop.
     if m < 2:
         raise ValueError("m must be >= 2")
@@ -54,15 +54,18 @@ def _int_on_grid(upr: torch.Tensor, vals: torch.Tensor, grid: torch.Tensor) -> t
 class InterpolationGrid:
     # Torch port of vinecopulib::tools_interpolation::InterpolationGrid.
     def __init__(self, grid_points: torch.Tensor, values: torch.Tensor, norm_times: int = 3):
-        grid_points = torch.as_tensor(grid_points, dtype=torch.float64)
-        values = torch.as_tensor(values, dtype=torch.float64)
-        if values.ndim != 2 or values.shape[0] != values.shape[1]:
+        self.grid_points = torch.as_tensor(grid_points)
+        self.values = torch.as_tensor(values)
+        if self.values.ndim != 2 or self.values.shape[0] != self.values.shape[1]:
             raise ValueError("values must be a square (m,m) tensor")
-        if grid_points.ndim != 1 or grid_points.numel() != values.shape[0]:
+        if self.grid_points.ndim != 1 or self.grid_points.numel() != self.values.shape[0]:
             raise ValueError("grid_points must have shape (m,) matching values")
-        self.grid_points = grid_points
-        self.values = values
         self.normalize_margins(int(norm_times))
+
+    def to(self, *args, **kwargs) -> "InterpolationGrid":
+        self.grid_points = self.grid_points.to(*args, **kwargs)
+        self.values = self.values.to(*args, **kwargs)
+        return self
 
     def get_values(self) -> torch.Tensor:
         return self.values

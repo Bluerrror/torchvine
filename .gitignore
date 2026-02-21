@@ -15,3 +15,5 @@ pytest-cache-files-*/
 # benchmark artifacts
 benchmarks/*.png
 benchmarks/*.json
+
+benchmarks/results/

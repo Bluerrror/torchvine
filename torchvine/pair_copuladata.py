@@ -26,7 +26,7 @@ def pairs_copula_data(
 
     if data is None:
         raise ValueError("`data` cannot be None.")
-    U = torch.as_tensor(data, dtype=torch.float64)
+    U = torch.as_tensor(data)
     if U.ndim != 2:
         raise ValueError("`data` must be 2-D (n, d).")
     if U.numel() == 0:
@@ -44,7 +44,7 @@ def pairs_copula_data(
     if cols is None:
         cols = [f"var{i + 1}" for i in range(d)]
 
-    z = torch.linspace(-3.0, 3.0, int(grid_size), dtype=torch.float64)
+    z = torch.linspace(-3.0, 3.0, int(grid_size), dtype=U.dtype, device=U.device)
     Z1, Z2 = torch.meshgrid(z, z, indexing="xy")
     U1 = 0.5 * (1.0 + torch.erf(Z1 / math.sqrt(2.0)))
     U2 = 0.5 * (1.0 + torch.erf(Z2 / math.sqrt(2.0)))

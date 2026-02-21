@@ -255,7 +255,7 @@ def pbvt(x1: torch.Tensor, x2: torch.Tensor, rho: torch.Tensor, nu: torch.Tensor
 
 def pearson_cor(x: torch.Tensor, y: torch.Tensor, *, weights: torch.Tensor | None = None) -> float:
     """Weighted Pearson correlation (weights optional)."""
-    x = _as_tensor(x, dtype=torch.float64).reshape(-1)
+    x = _as_tensor(x).reshape(-1)
     y = _as_tensor(y, device=x.device, dtype=x.dtype).reshape(-1)
     if x.numel() != y.numel():
         raise ValueError("x and y must have the same length")
@@ -284,36 +284,47 @@ def pearson_cor(x: torch.Tensor, y: torch.Tensor, *, weights: torch.Tensor | Non
     return float((num / den).clamp(-1.0, 1.0).item())
 
 
-def _count_inversions_bit(ranks_list: list[int], max_val: int) -> int:
-    """Count inversions using BIT (Fenwick tree) on a Python list — O(n log n)."""
-    n = len(ranks_list)
-    bit = [0] * (max_val + 2)
+def _count_inversions_merge(ranks_list: list[int], n: int) -> int:
+    """Count inversions via iterative bottom-up merge sort — O(n log n)."""
+    a = list(ranks_list)
+    buf = [0] * n
     inv = 0
-    for i in range(n):
-        v = ranks_list[i]
-        # query prefix sum [1..v]
-        s = 0
-        j = v
-        while j > 0:
-            s += bit[j]
-            j -= j & (-j)
-        inv += i - s
-        # point update at v
-        j = v
-        while j <= max_val:
-            bit[j] += 1
-            j += j & (-j)
+    width = 1
+    while width < n:
+        for start in range(0, n, 2 * width):
+            mid = min(start + width, n)
+            end = min(start + 2 * width, n)
+            i, j, k = start, mid, start
+            while i < mid and j < end:
+                if a[i] <= a[j]:
+                    buf[k] = a[i]
+                    i += 1
+                else:
+                    buf[k] = a[j]
+                    inv += mid - i
+                    j += 1
+                k += 1
+            while i < mid:
+                buf[k] = a[i]
+                i += 1
+                k += 1
+            while j < end:
+                buf[k] = a[j]
+                j += 1
+                k += 1
+        a, buf = buf, a
+        width *= 2
     return inv
 
 
 def kendall_tau(x: torch.Tensor, y: torch.Tensor, *, weights: torch.Tensor | None = None) -> float:
     """Kendall's tau for (mostly) continuous data — pure PyTorch, no external deps.
 
-    Unweighted path: O(n log n) via BIT inversion counting, or O(n^2) vectorized
+    Unweighted path: O(n log n) merge-sort inversion count, or O(n^2) vectorized
     for small n.
     Weighted path: vectorized O(n^2) using torch.
     """
-    x = _as_tensor(x, dtype=torch.float64).reshape(-1)
+    x = _as_tensor(x).reshape(-1)
     y = _as_tensor(y, device=x.device, dtype=x.dtype).reshape(-1)
     n = int(x.numel())
     if n != int(y.numel()):
@@ -339,7 +350,7 @@ def kendall_tau(x: torch.Tensor, y: torch.Tensor, *, weights: torch.Tensor | Non
         denom = conc + disc
         return 0.0 if float(denom.item()) == 0.0 else float(((conc - disc) / denom).clamp(-1.0, 1.0).item())
 
-    # Vectorized O(n^2) for small n — avoids sort/BIT overhead
+    # Vectorized O(n^2) for very small n — avoids sort overhead
     if n <= 200:
         dx = x.unsqueeze(1) - x.unsqueeze(0)
         dy = y.unsqueeze(1) - y.unsqueeze(0)
@@ -353,22 +364,27 @@ def kendall_tau(x: torch.Tensor, y: torch.Tensor, *, weights: torch.Tensor | Non
             return 0.0
         return float(max(-1.0, min(1.0, float(((c - d).float() / denom.float()).item()))))
 
-    # O(n log n) BIT-based inversion counting — pure Python/torch
+    # Sort by x, count inversions in y-ranks
     idx = torch.argsort(x)
     y_sorted = y[idx]
     order = torch.argsort(y_sorted, stable=True)
     ranks = torch.empty_like(order)
     ranks[order] = torch.arange(1, n + 1, device=x.device, dtype=order.dtype)
-    ranks_list = ranks.tolist()
-    max_val = max(ranks_list)
-    inv = _count_inversions_bit(ranks_list, max_val)
+
+    if n <= 600:
+        # Vectorized O(n^2) on medium n; above this, nlogn merge is faster.
+        inv = int(ranks.unsqueeze(1).gt(ranks.unsqueeze(0)).triu(diagonal=1).sum().item())
+    else:
+        # O(n log n) iterative merge sort on Python list
+        inv = _count_inversions_merge(ranks.tolist(), n)
+
     tau = 1.0 - 4.0 * float(inv) / (float(n) * float(n - 1))
     return float(max(-1.0, min(1.0, tau)))
 
 
 def spearman_rho(x: torch.Tensor, y: torch.Tensor, *, weights: torch.Tensor | None = None) -> float:
     """Spearman's rank correlation (weighted optional) — pure torch."""
-    x = _as_tensor(x, dtype=torch.float64).reshape(-1)
+    x = _as_tensor(x).reshape(-1)
     y = _as_tensor(y, device=x.device, dtype=x.dtype).reshape(-1)
     n = int(x.numel())
     if n != int(y.numel()):
@@ -391,7 +407,7 @@ def _rank(x: torch.Tensor) -> torch.Tensor:
 
 def blomqvist_beta(x: torch.Tensor, y: torch.Tensor, *, weights: torch.Tensor | None = None) -> float:
     """Blomqvist's beta (medial correlation coefficient) — pure torch."""
-    x = _as_tensor(x, dtype=torch.float64).reshape(-1)
+    x = _as_tensor(x).reshape(-1)
     y = _as_tensor(y, device=x.device, dtype=x.dtype).reshape(-1)
     n = int(x.numel())
     if n != int(y.numel()):
@@ -414,7 +430,7 @@ def hoeffding_d(x: torch.Tensor, y: torch.Tensor, *, weights: torch.Tensor | Non
 
     Returns a value in approximately [−0.5, 1]; 0 indicates independence.
     """
-    x = _as_tensor(x, dtype=torch.float64).reshape(-1)
+    x = _as_tensor(x).reshape(-1)
     y = _as_tensor(y, device=x.device, dtype=x.dtype).reshape(-1)
     n = int(x.numel())
     if n != int(y.numel()):

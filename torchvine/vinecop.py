@@ -101,6 +101,13 @@ class Vinecop:
 
         return cls(structure=structure, pair_copulas=pcs, var_types=vt, nobs=0)
 
+    def to(self, *args, **kwargs) -> "Vinecop":
+        """Move all pair-copulas to device/dtype (in-place)."""
+        for tree in self.pair_copulas:
+            for pc in tree:
+                pc.to(*args, **kwargs)
+        return self
+
     def _format_data(self, u: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Format input data into (u_main, u_sub_full) with shape (n,d) each.
 
@@ -110,7 +117,7 @@ class Vinecop:
         - (n,d+k) where k = number of discrete variables and the extra columns
           contain u_sub for discrete variables in the order they appear.
         """
-        u = torch.as_tensor(u, dtype=torch.float64)
+        u = torch.as_tensor(u)
         if u.ndim != 2:
             raise ValueError("u must be 2D")
         d = int(self.structure.d)
@@ -211,7 +218,7 @@ class Vinecop:
         *,
         var_types: Sequence[str] | None = None,
     ) -> "Vinecop":
-        data = torch.as_tensor(data, dtype=torch.float64)
+        data = torch.as_tensor(data)
         if data.ndim != 2:
             raise ValueError("data must be 2D")
         if controls is None:
@@ -257,7 +264,7 @@ class Vinecop:
 
     @property
     def parameters(self) -> list[list[torch.Tensor]]:
-        return [[torch.as_tensor(pc.parameters, dtype=torch.float64) for pc in tree] for tree in self.pair_copulas]
+        return [[torch.as_tensor(pc.parameters).tolist() for pc in tree] for tree in self.pair_copulas]
 
     @property
     def families(self) -> list[list[str]]:
@@ -305,7 +312,7 @@ class Vinecop:
         for t in range(len(self.pair_copulas)):
             for e in range(len(self.pair_copulas[t])):
                 pc = self.pair_copulas[t][e]
-                p = torch.as_tensor(pc.parameters, dtype=torch.float64).reshape(-1)
+                p = torch.as_tensor(pc.parameters).reshape(-1)
                 pstr = ", ".join(f"{v:.2f}" for v in p.tolist()) if p.numel() > 0 and pc.family != BicopFamily.tll else ""
                 try:
                     tau = f"{pc.tau:.2f}"
@@ -349,7 +356,7 @@ class Vinecop:
         return int(self.get_pair_copula(tree, edge).rotation)
 
     def get_parameters(self, tree: int, edge: int) -> torch.Tensor:
-        return torch.as_tensor(self.get_pair_copula(tree, edge).parameters, dtype=torch.float64)
+        return torch.as_tensor(self.get_pair_copula(tree, edge).parameters)
 
     def pdf(self, u: torch.Tensor) -> torch.Tensor:
         """Evaluate continuous vine copula density (pdf)."""
@@ -389,6 +396,8 @@ class Vinecop:
         for tree in range(trunc_lvl):
             for edge in range(d - tree - 1):
                 cop = self.pair_copulas[tree][edge]
+                
+                # Retrieve conditioned variables (u1, u2)
                 m = self.structure.min_at(tree, edge)
                 u1 = hfunc2[edge]
                 if m == self.structure.struct_at(tree, edge):
@@ -398,15 +407,25 @@ class Vinecop:
                     u2 = hfunc1[m - 1]
                     u2_sub = hfunc1_sub[m - 1]
 
+                if cop.family == BicopFamily.indep:
+                    # hfunc1(u1,u2) = u1, hfunc2(u1,u2) = u2
+                    if self.structure.needed_hfunc1_at(tree, edge):
+                        hfunc1[edge] = u1
+                        hfunc1_sub[edge] = hfunc2_sub[edge]
+                    if self.structure.needed_hfunc2_at(tree, edge):
+                        hfunc2[edge] = u2
+                        hfunc2_sub[edge] = u2_sub
+                    continue
+
                 if "d" in cop.var_types:
                     u1_sub = hfunc2_sub[edge]
                     uu = torch.stack([u1, u2, u1_sub, u2_sub], dim=1)
                 else:
                     uu = torch.stack([u1, u2], dim=1)
-                dens = cop.pdf(uu)
-                pdf = pdf * dens
+                
+                pdf = pdf * cop.pdf(uu)
 
-                # Compute h-functions only if needed (mirrors vinecopulib).
+                # Compute h-functions only if needed.
                 if self.structure.needed_hfunc1_at(tree, edge):
                     hfunc1[edge] = cop.hfunc1(uu)
                     if cop.var_types[1] == "d" and uu.shape[1] == 4:
@@ -469,7 +488,7 @@ class Vinecop:
 
         For discrete models, only the first d columns are used as evaluation points.
         """
-        u = torch.as_tensor(u, dtype=torch.float64)
+        u = torch.as_tensor(u)
         u_main, _u_sub = self._format_data(u)
         u_main = clamp_unit(u_main)
         n = int(u_main.shape[0])
@@ -520,7 +539,7 @@ class Vinecop:
             preselect_families=controls.preselect_families,
             allow_rotations=controls.allow_rotations,
         )
-        data = torch.as_tensor(data, dtype=torch.float64)
+        data = torch.as_tensor(data)
         self.nobs = int(data.shape[0])
         selector = VinecopSelectorTorch(
             data=clamp_unit(data),
@@ -541,7 +560,8 @@ class Vinecop:
         """
         if controls is None:
             controls = FitControlsVinecop()
-        data = torch.as_tensor(data, dtype=torch.float64)
+        data = torch.as_tensor(data)
+        self.to(device=data.device, dtype=data.dtype)
         d = self.structure.d
         if data.ndim != 2:
             raise ValueError("data must be 2D")
@@ -595,7 +615,7 @@ class Vinecop:
         where F^- is the left limit (provided via the discrete data layout).
         """
         _ = num_threads
-        u = torch.as_tensor(u, dtype=torch.float64)
+        u = torch.as_tensor(u)
         u_main, u_sub = self._format_data(u)
         d = int(self.structure.d)
         trunc_lvl = int(self.structure.trunc_lvl)
@@ -750,7 +770,11 @@ class Vinecop:
         out = torch.stack(vals, dim=1)  # type: ignore[arg-type]
         return out
 
-    def simulate(self, n: int, *, device=None, dtype=torch.float64, seeds=None) -> torch.Tensor:
+    def simulate(self, n: int, *, device=None, dtype=None, seeds=None) -> torch.Tensor:
+        if device is None:
+            device = self.pair_copulas[0][0].parameters.device if (len(self.pair_copulas)>0 and len(self.pair_copulas[0])>0) else None
+        if dtype is None:
+            dtype = self.pair_copulas[0][0].parameters.dtype if (len(self.pair_copulas)>0 and len(self.pair_copulas[0])>0) else torch.float32
         # Mirrors C++: generate uniforms then inverse_rosenblatt.
         g = None
         if seeds:
